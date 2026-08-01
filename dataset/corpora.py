@@ -18,6 +18,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 DATA_DIR = Path("data")
 
@@ -148,7 +149,7 @@ def prepare_documents(
     seed: int = 0,
     eot_token: str | None = "<|endoftext|>",
     out_dir: Path | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Split → encode → write ``train.bin`` / ``val.bin`` from documents in memory.
 
     The entry point for any corpus that is not a plain URL download — a local
@@ -192,7 +193,7 @@ def prepare(
     seed: int = 0,
     eot_token: str | None = "<|endoftext|>",
     out_dir: Path | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Download → split by document → encode → write ``train.bin`` / ``val.bin``."""
     entry = CORPORA[corpus] if isinstance(corpus, str) else corpus
     documents = read_documents(download(entry), entry.doc_separator)
