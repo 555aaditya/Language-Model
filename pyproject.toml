@@ -22,6 +22,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Corpus downloads from a TLS-inspecting corporate network (Zscaler and similar)
+# verify against a corporate root CA that certifi's bundle does not carry, so
+# requests fails where curl succeeds. truststore routes verification through the
+# OS keychain instead. See dataset.corpora.use_system_trust_store.
+data = [
+    "truststore>=0.9",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
