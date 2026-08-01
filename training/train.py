@@ -125,6 +125,7 @@ def main() -> None:
     ckpt_every = int(cfg["training"].get("ckpt_every", 0))
     eval_every = int(cfg["training"].get("eval_every", 0))
     eval_batches = int(cfg["training"].get("eval_batches", 20))
+    patience = int(cfg["training"].get("early_stop_patience", 0))
 
     print(
         f"device {device} | amp {amp_dtype or 'off (fp32)'} | "
@@ -142,9 +143,15 @@ def main() -> None:
             return
         last_evaluated = step
         val = trainer.evaluate(val_engine, batches=eval_batches)
+        marker = ""
+        if val["val_improved"]:
+            # Save on improvement, not on a step interval: a periodic checkpoint
+            # will miss the optimum and leave only over-trained weights on disk.
+            trainer.save(str(out_dir / "best.pt"))
+            marker = "  <- best, saved"
         print(
             f"step {step:>6}/{steps}  val_loss {val['val_loss']:.4f}  "
-            f"val_ppl {val['val_perplexity']:.2f}"
+            f"val_ppl {val['val_perplexity']:.2f}{marker}"
         )
 
     for _ in range(steps):
@@ -160,8 +167,20 @@ def main() -> None:
             report_validation(n)
         if ckpt_every and n % ckpt_every == 0:
             trainer.save(str(out_dir / f"step_{n}.pt"))
+        if trainer.should_stop_early(patience):
+            print(
+                f"early stop at step {n}: {trainer.evals_since_improvement} evaluations "
+                f"without improvement (best val_loss {trainer.best_val_loss:.4f} "
+                f"at step {trainer.best_step})"
+            )
+            break
 
     report_validation(trainer.step_count)
+    if trainer.best_step >= 0:
+        print(
+            f"best val_loss {trainer.best_val_loss:.4f} at step {trainer.best_step} "
+            f"-> {out_dir / 'best.pt'}"
+        )
     final = out_dir / "final.pt"
     trainer.save(str(final))
     print(f"saved {final}")

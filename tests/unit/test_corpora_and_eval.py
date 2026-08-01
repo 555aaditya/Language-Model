@@ -158,8 +158,10 @@ def test_evaluate_reports_loss_and_perplexity():
     cfg = make_cfg()
     trainer = Trainer(CausalLM.from_config(cfg), ConstantEngine(), cfg, device=torch.device("cpu"))
     metrics = trainer.evaluate(ConstantEngine(1), batches=3)
-    assert set(metrics) == {"val_loss", "val_perplexity"}
+    assert {"val_loss", "val_perplexity"} <= set(metrics)
     assert metrics["val_perplexity"] == pytest.approx(math.exp(metrics["val_loss"]), rel=1e-6)
+    # Best-tracking fields ride along so callers can save on improvement.
+    assert {"val_improved", "best_val_loss", "best_step"} <= set(metrics)
 
 
 def test_untrained_validation_perplexity_is_near_the_vocabulary_size():
@@ -193,6 +195,79 @@ def test_training_lowers_validation_loss_on_the_same_distribution():
     trainer.train(150)
     after = trainer.evaluate(engine, batches=2)["val_loss"]
     assert after < before / 2, f"{before:.3f} -> {after:.3f}"
+
+
+class DecreasingEngine:
+    """Yields batches whose loss falls then rises, to drive the tracking logic."""
+
+    def __init__(self, losses):
+        self.losses = list(losses)
+        self.i = 0
+
+    def next_batch(self, device=None):
+        return {
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "labels": torch.zeros(1, 4, dtype=torch.long),
+        }
+
+
+def make_trainer():
+    cfg = make_cfg()
+    return Trainer(CausalLM.from_config(cfg), ConstantEngine(), cfg, device=torch.device("cpu"))
+
+
+def test_best_validation_loss_is_tracked():
+    """Without this, a run keeps only its most recent weights -- which after
+    overfitting are its *worst*. The first TinyShakespeare run bottomed at val
+    perplexity 98.9 near step 500 and finished at 304.6, and the good weights
+    were never written to disk."""
+    trainer = make_trainer()
+    assert trainer.best_val_loss == float("inf")
+    assert trainer.best_step == -1
+
+    first = trainer.evaluate(ConstantEngine(1), batches=2)
+    assert first["val_improved"] == 1.0
+    assert trainer.best_val_loss == pytest.approx(first["val_loss"])
+    assert trainer.best_step == trainer.step_count
+
+
+def test_a_worse_evaluation_does_not_overwrite_the_best():
+    trainer = make_trainer()
+    trainer.evaluate(ConstantEngine(1), batches=2)
+    best = trainer.best_val_loss
+
+    trainer.best_val_loss = best - 1.0  # pretend an earlier eval was better
+    result = trainer.evaluate(ConstantEngine(1), batches=2)
+    assert result["val_improved"] == 0.0
+    assert trainer.best_val_loss == pytest.approx(best - 1.0)
+
+
+def test_stagnation_is_counted_in_evaluations():
+    trainer = make_trainer()
+    trainer.evaluate(ConstantEngine(1), batches=2)
+    assert trainer.evals_since_improvement == 0
+
+    trainer.best_val_loss = -1.0  # nothing can beat this
+    for expected in (1, 2, 3):
+        trainer.evaluate(ConstantEngine(1), batches=2)
+        assert trainer.evals_since_improvement == expected
+
+
+def test_early_stop_triggers_only_after_patience_is_exhausted():
+    trainer = make_trainer()
+    trainer.best_val_loss = -1.0
+    assert not trainer.should_stop_early(2)
+    trainer.evaluate(ConstantEngine(1), batches=2)
+    assert not trainer.should_stop_early(2)
+    trainer.evaluate(ConstantEngine(1), batches=2)
+    assert trainer.should_stop_early(2)
+
+
+def test_patience_of_zero_disables_early_stopping():
+    trainer = make_trainer()
+    trainer.evals_since_improvement = 99
+    assert not trainer.should_stop_early(0)
+    assert not trainer.should_stop_early(-1)
 
 
 # ---------------------------------------------------------------------------
