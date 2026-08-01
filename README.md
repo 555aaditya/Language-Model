@@ -5,7 +5,7 @@
 <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white">
 <img src="https://img.shields.io/badge/Apple_Silicon-MPS-000000?logo=apple&logoColor=white">
-<img src="https://img.shields.io/badge/tests-267_passing-4CAF50?logo=pytest&logoColor=white">
+<img src="https://img.shields.io/badge/tests-359_passing-4CAF50?logo=pytest&logoColor=white">
 <img src="https://img.shields.io/badge/ruff-linted-D7FF64?logo=ruff&logoColor=black">
 <img src="https://img.shields.io/badge/mypy-typed-2A6DB2?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/License-MIT-FF6F00">
@@ -18,11 +18,11 @@
 
 *This project builds a complete language model system from first principles, with the emphasis on low-level systems engineering rather than on training a model quickly.*
 
-- **Everything is hand-written:** BPE merges, rotary embeddings, grouped-query attention, the KV cache, and a tiled online-softmax attention kernel are all implemented directly — the only thing borrowed from PyTorch is autograd and tensor math.
+- **Everything is hand-written:** BPE merges, rotary embeddings, grouped-query attention, the KV cache, a tiled online-softmax attention kernel *with its own recomputing backward*, and AdamW are all implemented directly — the only thing borrowed from PyTorch is tensor math.
 - **Three interchangeable attention kernels:** a readable `manual` reference, torch's fused `sdpa`, and our own `flash` tiled implementation. All three are asserted to produce identical output, so the reference acts as a correctness oracle for the optimised paths.
 - **Memory-mapped data engine:** the corpus is a bare `uint16` array on disk read through `mmap`, so window count comes from `stat()` alone and no bulk copy ever enters RAM — even with multiprocessing workers.
 - **GQA that actually saves memory:** 8 query heads share 2 KV heads, shrinking the KV cache **4×** (2048 KiB → 512 KiB per layer at 512 tokens) and the attention parameters by 37.5%.
-- **Test-driven throughout:** every module's exit test is written before its implementation. **267 tests** currently pass across unit and integration suites.
+- **Test-driven throughout:** every module's exit test is written before its implementation. **359 tests** currently pass across unit and integration suites.
 - **Runs on Apple Silicon:** device resolution is `mps → cuda → cpu`, with bf16 autocast on MPS and no `GradScaler` (which is CUDA-only).
 
 ---
@@ -33,7 +33,7 @@
 flowchart TB
     RAW["📄 Raw text corpus"]
 
-    subgraph BUILT ["Implemented — 267 tests"]
+    subgraph BUILT ["Implemented — 359 tests"]
         TOK["<b>tokenizer/</b><br/>byte-level BPE<br/>train · encode · decode"]
         DS["<b>dataset/</b><br/>mmap + streaming<br/>windowing · sharding"]
         ATT["<b>attention/</b><br/>GQA + RoPE + KV cache<br/>manual · sdpa · flash"]
@@ -64,12 +64,12 @@ flowchart TB
 
 | Module | Responsibility | State |
 |---|---|---|
-| `tokenizer/` | Byte-level BPE with GPT-2 style rendered-unicode keys, special tokens, JSON serialisation | ✅ 14 tests |
-| `dataset/` | `uint16` corpus format, memory-mapped and streaming readers, worker sharding, `DataEngine` | ✅ 29 tests |
-| `attention/` | RoPE, grouped-query causal attention, KV cache, three interchangeable kernels | ✅ 39 tests |
+| `tokenizer/` | Byte-level BPE, GPT-2 pre-tokenization, piece cache, incremental training index | ✅ 54 tests |
+| `dataset/` | `uint16` corpus format, mmap/streaming readers, corpus download, document split, message prep | ✅ 76 tests |
+| `attention/` | RoPE, grouped-query causal attention, KV cache, three kernels + recomputing backward | ✅ 43 tests |
 | `model/` | RMSNorm, SwiGLU, pre-norm blocks, `CausalLM` with weight tying and depth-scaled init | ✅ 25 tests |
-| `training/` | Hand-written AdamW, cosine schedule, AMP, grad accumulation, checkpointing | ✅ 58 tests |
-| `inference/` | Greedy / top-k / top-p sampling, cached autoregressive generation | ✅ 29 tests |
+| `training/` | Hand-written AdamW, cosine schedule, AMP, grad accumulation, checkpoints, validation | ✅ 58 tests |
+| `inference/` | Greedy / top-k / top-p sampling, cached generation, batched generation | ✅ 29 tests |
 | `optimization/` | int8 / int4 per-channel weight quantization, preallocated KV arena | ✅ 38 tests |
 | `benchmark/` | Device-synced timing harness, p50/p90/p95/p99, exact memory metrics, baseline report | ✅ 25 tests |
 
@@ -200,6 +200,59 @@ The full `T × T` score matrix is never allocated — peak memory is O(T) rather
 
 ---
 
+### Training on Real Data
+
+```bash
+python -m dataset.prepare_corpus --corpus tinyshakespeare --vocab-size 8192
+python -m training.train --config configs/tinyshakespeare.yaml
+```
+
+`prepare_corpus` downloads, fits a vocabulary on a bounded sample, splits **by
+document**, and writes `train.bin` / `val.bin` beside the `vocab.json` they were
+encoded with. Training then reports held-out perplexity every `eval_every` steps.
+
+Two properties worth knowing:
+
+- **The split is by document, never by token.** Windows are contiguous slices of
+  one flat array, so cutting a *tokenised* stream puts validation tokens inside
+  training windows and the reported perplexity comes out quietly too good.
+  Documents are assigned by a hash of their own text, so the split is
+  reproducible without storing a seed, and adding documents never reshuffles
+  existing ones across the boundary.
+- **Corpora are never committed.** `data/` is gitignored, and every entry records
+  its licence, because "where did the training data come from" is unpleasant to
+  answer retroactively.
+
+Behind a TLS-inspecting corporate proxy (Zscaler and similar), `requests` fails
+where `curl` succeeds — the proxy re-signs certificates with a corporate root CA
+that certifi does not carry. `pip install -e ".[data]"` pulls in `truststore`,
+which routes verification through the OS keychain. Verification is never
+disabled.
+
+#### Email and chat corpora
+
+`dataset/messages.py` prepares mail and message records — stripping quoted
+replies, signatures and confidentiality footers, optionally adding
+`<|from|>` / `<|subject|>` / `<|body|>` structure tokens, and masking recognisable
+identifier shapes. It ships **no connector to any mailbox or workspace**;
+the caller supplies the records.
+
+Read the module docstring before pointing it at real mail. Three things are true
+and none of them are obvious:
+
+1. **A model memorises its training data.** This project measured a 32.5M-param
+   model reaching loss 0.017 on a 10,677-token corpus — reproducing it. A
+   checkpoint trained on mail *is* a copy of that mail and inherits its handling
+   obligations.
+2. **`redact()` is best-effort, not a compliance control.** It catches shapes
+   (addresses, phone numbers, long digit runs). It cannot catch a name in prose
+   or a deal codename — `test_redaction_cannot_catch_a_name_in_prose` pins that
+   limit deliberately.
+3. **A mailbox is a fine-tuning corpus, not a pretraining one.** ~1–10M tokens
+   against the ~650M this model size wants; trained alone it memorises.
+
+---
+
 ### Optimization Strategy
 
 | Concept | Implementation | Measured effect |
@@ -269,7 +322,7 @@ pytest
 
 *Expected output:*
 ```
-267 passed
+359 passed
 ```
 
 #### Run the entry point
@@ -295,7 +348,7 @@ python -m training.train --config configs/default.yaml training.lr=3e-4 model.n_
 ### Testing
 
 ```bash
-pytest                                    # everything (267 tests)
+pytest                                    # everything (359 tests)
 pytest tests/unit -q                      # unit only
 pytest tests/integration -q               # cross-module seams
 pytest tests/unit/test_attention.py -q    # one module
@@ -324,6 +377,9 @@ pytest --cov=tokenizer --cov=dataset --cov=attention --cov-report=term-missing
 | `test_quantization.py` | 21 | int8/int4 round-trip error bounds, per-channel scales, real byte savings, perplexity tolerance |
 | `test_kv_pool.py` | 17 | Arena never reallocates, returns only the filled prefix, generates identically to the concat cache |
 | `test_benchmark.py` | 25 | Device sync, interpolated percentiles, undersampling detection, exact memory arithmetic, baseline reproduction |
+| `test_pretokenize.py` | 40 | Pattern tiles every input, no cross-piece merges, cache soundness, sub-quadratic scaling |
+| `test_messages.py` | 22 | Quoted-reply/signature/disclaimer stripping, redaction limits, structure tokens |
+| `test_corpora_and_eval.py` | 25 | Document-split disjointness and stability, validation perplexity, batched generation |
 | `test_end_to_end.py` | 5 | Full pipeline learns real text; trained model's cache stays equivalent; resume converges |
 
 ---
@@ -478,7 +534,7 @@ Each stage has an exit test written *before* the implementation. See [`docs/BUIL
 | **PyTorch 2.13** | Autograd, tensor math, and device management — every layer above that is hand-written |
 | **NumPy** | `memmap` corpus reader and the `uint16` on-disk token format |
 | **Apple MPS** | Primary development accelerator; bf16 autocast, fused `scaled_dot_product_attention` |
-| **pytest** | 267-test TDD suite — exit tests written before each module |
+| **pytest** | 359-test TDD suite — exit tests written before each module |
 | **ruff** | Linting and formatting, 100-char lines, `E/F/I/W/UP/B` rule set |
 | **mypy** | Static type checking across all eight packages |
 | **PyYAML** | Config format, reused as the CLI override parser so types can never diverge |
@@ -511,11 +567,15 @@ Full rationale and alternatives for each is recorded as a Technical Decision Rec
 ```
 Language-Model/
 ├── tokenizer/        # byte-level BPE          ✅
-│   └── bpe.py
+│   ├── bpe.py
+│   └── pretokenize.py    # GPT-2 style splitter (TDR-020)
 ├── dataset/          # data engine             ✅
 │   ├── binfile.py        # uint16 corpus format
 │   ├── token_dataset.py  # mmap / streaming / synthetic readers
-│   └── engine.py         # DataEngine → endless device-ready batches
+│   ├── engine.py         # DataEngine → endless device-ready batches
+│   ├── corpora.py        # download + document-level train/val split
+│   ├── messages.py       # email / chat cleaning and redaction
+│   └── prepare_corpus.py # preparation CLI
 ├── attention/        # attention               ✅
 │   ├── rope.py           # rotary position embeddings
 │   ├── kv_cache.py       # per-layer K/V cache
@@ -535,7 +595,8 @@ Language-Model/
 │   └── train.py          # config, overrides, CLI
 ├── inference/        # generation              ✅
 │   ├── sampling.py       # temperature · top-k · top-p
-│   └── generate.py       # cached autoregressive loop
+│   ├── generate.py       # cached autoregressive loop
+│   └── batched.py        # multi-request generation
 ├── optimization/     # post-training opt       ✅
 │   ├── quantize.py       # int8 / int4 per-channel weights
 │   └── kv_pool.py        # preallocated KV arena
