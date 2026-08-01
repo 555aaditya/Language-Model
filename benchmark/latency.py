@@ -100,10 +100,10 @@ def kv_cache_speedup(
     common = {"prompt_len": prompt_len, "max_new_tokens": max_new_tokens, "repeats": repeats}
     cached = benchmark_decode(model, use_cache=True, **common)
     uncached = benchmark_decode(model, use_cache=False, **common)
-    ratio = uncached["timing"]["median_ms"] / cached["timing"]["median_ms"]
+    ratio = uncached["timing"]["p50_ms"] / cached["timing"]["p50_ms"]
     return {
-        "cached_ms": cached["timing"]["median_ms"],
-        "uncached_ms": uncached["timing"]["median_ms"],
+        "cached_ms": cached["timing"]["p50_ms"],
+        "uncached_ms": uncached["timing"]["p50_ms"],
         "speedup": round(ratio, 3),
         "cache_wins": ratio > 1.0,
         "max_new_tokens": max_new_tokens,

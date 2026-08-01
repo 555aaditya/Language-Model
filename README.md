@@ -5,7 +5,7 @@
 <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white">
 <img src="https://img.shields.io/badge/Apple_Silicon-MPS-000000?logo=apple&logoColor=white">
-<img src="https://img.shields.io/badge/tests-264_passing-4CAF50?logo=pytest&logoColor=white">
+<img src="https://img.shields.io/badge/tests-267_passing-4CAF50?logo=pytest&logoColor=white">
 <img src="https://img.shields.io/badge/ruff-linted-D7FF64?logo=ruff&logoColor=black">
 <img src="https://img.shields.io/badge/mypy-typed-2A6DB2?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/License-MIT-FF6F00">
@@ -22,7 +22,7 @@
 - **Three interchangeable attention kernels:** a readable `manual` reference, torch's fused `sdpa`, and our own `flash` tiled implementation. All three are asserted to produce identical output, so the reference acts as a correctness oracle for the optimised paths.
 - **Memory-mapped data engine:** the corpus is a bare `uint16` array on disk read through `mmap`, so window count comes from `stat()` alone and no bulk copy ever enters RAM — even with multiprocessing workers.
 - **GQA that actually saves memory:** 8 query heads share 2 KV heads, shrinking the KV cache **4×** (2048 KiB → 512 KiB per layer at 512 tokens) and the attention parameters by 37.5%.
-- **Test-driven throughout:** every module's exit test is written before its implementation. **264 tests** currently pass across unit and integration suites.
+- **Test-driven throughout:** every module's exit test is written before its implementation. **267 tests** currently pass across unit and integration suites.
 - **Runs on Apple Silicon:** device resolution is `mps → cuda → cpu`, with bf16 autocast on MPS and no `GradScaler` (which is CUDA-only).
 
 ---
@@ -33,7 +33,7 @@
 flowchart TB
     RAW["📄 Raw text corpus"]
 
-    subgraph BUILT ["Implemented — 264 tests"]
+    subgraph BUILT ["Implemented — 267 tests"]
         TOK["<b>tokenizer/</b><br/>byte-level BPE<br/>train · encode · decode"]
         DS["<b>dataset/</b><br/>mmap + streaming<br/>windowing · sharding"]
         ATT["<b>attention/</b><br/>GQA + RoPE + KV cache<br/>manual · sdpa · flash"]
@@ -71,7 +71,7 @@ flowchart TB
 | `training/` | Hand-written AdamW, cosine schedule, AMP, grad accumulation, checkpointing | ✅ 58 tests |
 | `inference/` | Greedy / top-k / top-p sampling, cached autoregressive generation | ✅ 29 tests |
 | `optimization/` | int8 / int4 per-channel weight quantization, preallocated KV arena | ✅ 38 tests |
-| `benchmark/` | Device-synced timing harness, exact memory metrics, baseline report | ✅ 18 tests |
+| `benchmark/` | Device-synced timing harness, p50/p90/p95/p99, exact memory metrics, baseline report | ✅ 25 tests |
 
 ---
 
@@ -269,7 +269,7 @@ pytest
 
 *Expected output:*
 ```
-264 passed
+267 passed
 ```
 
 #### Run the entry point
@@ -295,7 +295,7 @@ python -m training.train --config configs/default.yaml training.lr=3e-4 model.n_
 ### Testing
 
 ```bash
-pytest                                    # everything (264 tests)
+pytest                                    # everything (267 tests)
 pytest tests/unit -q                      # unit only
 pytest tests/integration -q               # cross-module seams
 pytest tests/unit/test_attention.py -q    # one module
@@ -323,7 +323,7 @@ pytest --cov=tokenizer --cov=dataset --cov=attention --cov-report=term-missing
 | `test_tokenizer_dataset_attention.py` | 5 | Cross-module seams: tokenizer → `.bin` → batches → attention |
 | `test_quantization.py` | 21 | int8/int4 round-trip error bounds, per-channel scales, real byte savings, perplexity tolerance |
 | `test_kv_pool.py` | 17 | Arena never reallocates, returns only the filled prefix, generates identically to the concat cache |
-| `test_benchmark.py` | 18 | Device sync, percentile ordering, exact memory arithmetic, baseline reproduction |
+| `test_benchmark.py` | 25 | Device sync, interpolated percentiles, undersampling detection, exact memory arithmetic, baseline reproduction |
 | `test_end_to_end.py` | 5 | Full pipeline learns real text; trained model's cache stays equivalent; resume converges |
 
 ---
@@ -383,11 +383,19 @@ doesn't do.
 
 #### Measured — Apple M5 Pro, MPS, torch 2.13, bf16
 
-| Metric | Value |
-|---|---|
-| Prefill throughput | 8,026 tok/s |
-| Decode throughput | 411 tok/s (2.43 ms/token) |
-| Training throughput | ~75,000 tok/s |
+| Phase | runs | p50 | p90 | p95 | p99 | max | stdev |
+|---|---|---|---|---|---|---|---|
+| Prefill (32 tok) | 100 | 2.80 ms | 2.88 ms | 2.93 ms | 2.99 ms | 3.00 ms | 0.05 ms |
+| Decode (32 tok) | 20 | 77.86 ms | 78.21 ms | 78.39 ms | 78.73 ms | 78.81 ms | 0.35 ms |
+
+Throughput: **8,026 tok/s** prefill, **411 tok/s** decode (2.43 ms/token),
+**~75,000 tok/s** training.
+
+Sample counts are set per phase rather than globally, because a percentile is
+only as good as the samples behind it: with `n` runs the finest resolvable tail
+probability is `1/n`, so a p99 from 10 runs is just the maximum wearing a
+different label. Every timing therefore carries `resolvable_percentile`
+alongside it — p99.0 for prefill, p95.0 for the slower decode loop.
 
 KV cache speedup, measured rather than assumed (TDR-012):
 
@@ -470,7 +478,7 @@ Each stage has an exit test written *before* the implementation. See [`docs/BUIL
 | **PyTorch 2.13** | Autograd, tensor math, and device management — every layer above that is hand-written |
 | **NumPy** | `memmap` corpus reader and the `uint16` on-disk token format |
 | **Apple MPS** | Primary development accelerator; bf16 autocast, fused `scaled_dot_product_attention` |
-| **pytest** | 264-test TDD suite — exit tests written before each module |
+| **pytest** | 267-test TDD suite — exit tests written before each module |
 | **ruff** | Linting and formatting, 100-char lines, `E/F/I/W/UP/B` rule set |
 | **mypy** | Static type checking across all eight packages |
 | **PyYAML** | Config format, reused as the CLI override parser so types can never diverge |

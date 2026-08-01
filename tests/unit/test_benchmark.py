@@ -83,16 +83,72 @@ def test_warmup_calls_are_not_timed():
 
 def test_percentiles_are_ordered():
     timing = time_it(lambda: sum(range(500)), warmup=1, repeats=20, device="cpu")
-    assert timing.min_ms <= timing.median_ms <= timing.p90_ms <= timing.p99_ms
-    assert timing.p99_ms <= timing.max_ms
+    assert (
+        timing.min_ms
+        <= timing.p50_ms
+        <= timing.p90_ms
+        <= timing.p95_ms
+        <= timing.p99_ms
+        <= timing.max_ms
+    )
     assert timing.mean_ms > 0
+    assert timing.stdev_ms >= 0
 
 
 def test_timing_reports_median_alongside_mean():
     """Step times are right-skewed; a mean alone misrepresents steady state."""
     timing = Timing.from_samples([0.001] * 9 + [1.0])
-    assert timing.median_ms == pytest.approx(1.0)
-    assert timing.mean_ms > timing.median_ms * 50
+    assert timing.p50_ms == pytest.approx(1.0)
+    assert timing.mean_ms > timing.p50_ms * 50
+
+
+def test_median_is_an_alias_for_p50():
+    timing = Timing.from_samples([0.001, 0.002, 0.003])
+    assert timing.median_ms == timing.p50_ms
+
+
+def test_percentiles_are_interpolated_not_index_rounded():
+    """Regression: `ms[int(q*n)]` collapsed every high percentile onto max.
+
+    With 10 samples, int(0.90*10) == int(0.95*10) == int(0.99*10) == 9, so p90,
+    p95 and p99 all returned the maximum. They must be distinct here.
+    """
+    timing = Timing.from_samples([i / 1000 for i in range(1, 11)])  # 1..10 ms
+    assert timing.p90_ms < timing.p95_ms < timing.p99_ms
+    assert timing.p90_ms < timing.max_ms
+
+
+def test_percentiles_match_the_closed_form_on_a_known_sample():
+    """1..101 ms: the inclusive estimator puts pQ exactly at Q+1 ms."""
+    timing = Timing.from_samples([i / 1000 for i in range(1, 102)])
+    assert timing.p50_ms == pytest.approx(51.0)
+    assert timing.p90_ms == pytest.approx(91.0)
+    assert timing.p95_ms == pytest.approx(96.0)
+    assert timing.p99_ms == pytest.approx(100.0)
+
+
+def test_resolvable_percentile_exposes_undersampling():
+    """A p99 from 10 runs is not a p99; the report has to say so."""
+    assert Timing.from_samples([0.001] * 10).resolvable_percentile == pytest.approx(90.0)
+    assert Timing.from_samples([0.001] * 100).resolvable_percentile == pytest.approx(99.0)
+
+
+def test_a_single_sample_does_not_crash_the_estimator():
+    timing = Timing.from_samples([0.005])
+    assert timing.runs == 1
+    assert timing.p50_ms == timing.p99_ms == pytest.approx(5.0)
+    assert timing.stdev_ms == 0.0
+
+
+def test_no_samples_is_rejected():
+    with pytest.raises(ValueError, match="at least one sample"):
+        Timing.from_samples([])
+
+
+def test_as_dict_carries_every_percentile():
+    d = time_it(lambda: None, warmup=0, repeats=5, device="cpu").as_dict()
+    for key in ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "stdev_ms", "resolvable_percentile"):
+        assert key in d, f"as_dict is missing {key}"
 
 
 def test_zero_repeats_is_rejected():
@@ -170,13 +226,13 @@ def test_the_baseline_holds_no_wall_clock_numbers():
 def test_prefill_reports_positive_finite_throughput():
     report = benchmark_prefill(make_model(), prompt_len=16, repeats=3, warmup=1)
     assert report["tokens_per_sec"] > 0
-    assert report["timing"]["median_ms"] > 0
+    assert report["timing"]["p50_ms"] > 0
 
 
 def test_decode_reports_per_token_cost():
     report = benchmark_decode(make_model(), prompt_len=8, max_new_tokens=4, repeats=2)
     assert report["per_token_ms"] > 0
-    assert report["timing"]["median_ms"] >= report["per_token_ms"]
+    assert report["timing"]["p50_ms"] >= report["per_token_ms"]
 
 
 def test_kv_cache_speedup_reports_the_direction_it_measured():

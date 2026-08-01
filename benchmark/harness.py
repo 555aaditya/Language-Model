@@ -11,9 +11,15 @@ kernel compilation, lazy module init and allocator growth. Those costs are real
 but they are not per-step costs, so folding them into the average
 misrepresents steady state.
 
-Latency is reported as **median and percentiles, not just mean**. Step times are
+Latency is reported as **p50/p90/p95/p99, not just mean**. Step times are
 right-skewed — an allocator growth or a page fault produces occasional large
 outliers — so a mean quietly reports a number that no individual step achieved.
+
+A percentile is only as good as the sample count behind it: ``n`` runs resolve
+tail probabilities no finer than ``1/n``, so p99 needs ~100 runs to mean
+anything a p90 doesn't already say. ``Timing.resolvable_percentile`` reports
+that ceiling next to the numbers, because an undersampled p99 looks exactly
+like a well-sampled one.
 """
 
 from __future__ import annotations
@@ -45,27 +51,60 @@ class Timing:
 
     runs: int
     mean_ms: float
-    median_ms: float
+    stdev_ms: float
+    p50_ms: float
     p90_ms: float
+    p95_ms: float
     p99_ms: float
     min_ms: float
     max_ms: float
 
+    @property
+    def median_ms(self) -> float:
+        """Alias for ``p50_ms`` — the same statistic under its readable name."""
+        return self.p50_ms
+
+    @property
+    def resolvable_percentile(self) -> float:
+        """Highest percentile this sample count can distinguish from ``max``.
+
+        With ``n`` samples the smallest resolvable tail probability is ``1/n``,
+        so 10 runs cannot say anything about p99 that it doesn't also say about
+        p90 — both interpolate against the same top-most observation. Reported
+        alongside the percentiles so an undersampled p99 is visibly
+        undersampled rather than quietly meaningless.
+        """
+        return round(100.0 * (1.0 - 1.0 / self.runs), 2)
+
     @classmethod
     def from_samples(cls, samples_s: list[float]) -> Timing:
+        if not samples_s:
+            raise ValueError("need at least one sample")
         ms = sorted(s * 1000.0 for s in samples_s)
+
+        # Linear interpolation between order statistics (the standard
+        # "inclusive" estimator, matching numpy's default). The previous
+        # `ms[int(q * n)]` indexing collapsed every high percentile onto the
+        # maximum at small sample counts: with n=10, int(0.90*10) == int(0.99*10) == 9.
+        cuts = statistics.quantiles(ms, n=100, method="inclusive") if len(ms) > 1 else None
+
+        def pct(q: int) -> float:
+            return ms[0] if cuts is None else cuts[q - 1]
+
         return cls(
             runs=len(ms),
             mean_ms=statistics.fmean(ms),
-            median_ms=statistics.median(ms),
-            p90_ms=ms[min(len(ms) - 1, int(0.90 * len(ms)))],
-            p99_ms=ms[min(len(ms) - 1, int(0.99 * len(ms)))],
+            stdev_ms=statistics.stdev(ms) if len(ms) > 1 else 0.0,
+            p50_ms=pct(50),
+            p90_ms=pct(90),
+            p95_ms=pct(95),
+            p99_ms=pct(99),
             min_ms=ms[0],
             max_ms=ms[-1],
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "resolvable_percentile": self.resolvable_percentile}
 
 
 def time_it(
