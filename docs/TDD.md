@@ -1,7 +1,9 @@
 # Optimized GPT-style Language Model Engine Built From Scratch
 
 **Technical Design Document (TDD)**
-**Status:** Draft v1.1
+**Status:** Draft v1.2 — modern decoder stack (RoPE/RMSNorm/GQA/SwiGLU) adopted;
+TDR-006 superseded; module contracts unified with `BUILD_ORDER.md`; vault
+relocated (TDR-015 … TDR-019)
 **Audience:** Senior ML Engineers, Systems Engineers, Infrastructure Engineers
 
 > This document specifies the architecture, interfaces, algorithms, and engineering
@@ -24,7 +26,7 @@ benchmarking and testing strategy:
 1. **Custom Tokenizer** — byte-level BPE.
 2. **Efficient Dataset Engine** — memory-mapped, streaming, multiparallel feeder.
 3. **Transformer Architecture** — decoder-only blocks (embedding, causal
-   multi-head attention, MLP, output head).
+   grouped-query attention with RoPE, RMSNorm, SwiGLU FFN, output head).
 4. **Attention Optimization** — standard → block/flash-inspired tiled attention.
 5. **Training Engine** — AdamW, LR schedule, mixed precision, checkpointing.
 6. **Inference Engine** — autoregressive generation + KV cache + batching + sampling.
@@ -168,9 +170,13 @@ GPU Training Batch (x, y)
 - **Memory-Mapped Reader:** token ids stored as a flat array of `uint16`
   (`numpy.memmap` or `torch.from_file`). Only pages actually read are brought into
   memory by the OS.
-- **TokenDataset:** `__len__` = number of usable `block_size` windows; `__getitem__`
-  returns a contiguous slice `(T,)`; a `collate` fn offsets by one to produce
-  `(x, y)` pairs where `y = x shifted left by one`.
+- **TokenDataset:** `__len__` = number of usable `seq_len` windows; `__getitem__`
+  reads a contiguous slice of `seq_len + 1` ids and splits it into
+  `{"input_ids": s[:-1], "labels": s[1:]}` — the next-token shift happens at the
+  window level, so no `collate` fn is needed and the default collate batches the
+  dict straight to `[B, T]`. Reading `T+1` ids (rather than `T` and shifting
+  within the window) means the label for the final position is a real token
+  instead of padding.
 - **Multiprocessing workers:** each worker owns an independent memmap handle,
   avoiding GIL contention.
 - **Prefetching:** `DataLoader(num_workers, prefetch_factor, pin_memory,
@@ -207,61 +213,91 @@ sequence, and channel dims.
 ```
 tok ids (B, T)
    │
-Token Embedding (V → C)
-Positional Embedding (T → C)
-   │
+Token Embedding (V → C)          ← no positional embedding table; position
+   │                                enters inside attention via RoPE
 N × TransformerBlock:
-   ├─ LayerNorm → MultiHeadCausalAttention → Residual
-   ├─ LayerNorm → MLP (C→4C→C, GELU, dropout) → Residual
+   ├─ RMSNorm → CausalAttention (GQA + RoPE) → Residual
+   ├─ RMSNorm → SwiGLU MLP (C→d_ff→C)        → Residual
    │
-Final LayerNorm
+Final RMSNorm
    │
 LM Head (C → V)  → logits (B, T, V)
 ```
 
+This is the modern Llama-style decoder stack (RoPE + RMSNorm + GQA + SwiGLU)
+rather than the original GPT-2 stack. See TDR-015/016/017 for the rationale;
+TDR-006 (learnable absolute positions) is superseded.
+
 ### 3.2 Embedding Layer
 
-- **Token embeddings:** `nn.Embedding(V, C)`.
-- **Positional embeddings:** learnable absolute table `nn.Embedding(block_size, C)`,
-  added per position. Chosen for Phase 1 simplicity; Rotary/ALiBi flagged as future
-  improvements for longer-context extrapolation (see §13).
+- **Token embeddings:** `nn.Embedding(vocab_size, d_model)`.
+- **No positional embedding table.** Position is injected inside attention by
+  **Rotary Position Embeddings (RoPE)**, which rotate Q and K by a
+  position-dependent angle so that attention scores depend only on *relative*
+  offset. This removes a `max_seq_len × d_model` parameter table and permits
+  context extension by rescaling `rope_theta` (TDR-015).
+- **Weight tying:** the token embedding matrix is optionally reused as the LM
+  head, saving `vocab_size × d_model` parameters.
 
-### 3.3 Self-Attention
+### 3.3 Self-Attention (Grouped-Query + RoPE)
 
-- **Q/K/V projections:** a single fused `nn.Linear(C, 3C)` for efficiency, then
-  split into Q, K, V.
-- **Multi-head:** head size `d_head = C // n_head`; heads computed independently.
-- **Causal masking:** upper-triangular mask (future tokens set to `-inf`) applied to
-  the scaled `QKᵀ` scores.
-- **Scaling:** `scores /= sqrt(d_head)` to keep softmax in a well-conditioned range.
-- **Softmax + value aggregation:** `Attention(Q,K,V) = softmax(QKᵀ/sqrt(d)) V`.
-- **Output projection:** `nn.Linear(C, C)`.
+- **Q/K/V projections:** `q_proj: Linear(C, n_heads·d_head)`,
+  `k_proj`/`v_proj: Linear(C, n_kv_heads·d_head)`. Q and KV have *different*
+  output widths under GQA, so the fused `Linear(C, 3C)` of the GPT-2 design does
+  not apply; the three projections stay separate.
+- **Grouped-Query Attention:** `n_kv_heads < n_heads`; each KV head is shared by
+  `n_heads / n_kv_heads` query heads (must divide evenly). Shrinks the KV cache
+  by that same factor — the dominant memory term during decoding (TDR-016).
+- **RoPE:** applied to Q and K (never V) after projection and head-splitting,
+  using the absolute position of each token. During cached decoding the position
+  offset comes from the current cache length, not from the slice index.
+- **Causal masking:** future positions masked to `-inf`. The `sdpa` path uses
+  `is_causal=True`; the `manual` path builds an explicit upper-triangular mask.
+  During single-token cached decode the query attends over the whole cache and
+  no mask is needed.
+- **Scaling:** `scores /= sqrt(d_head)`.
+- **Output projection:** `nn.Linear(n_heads·d_head, C)`.
 
-### 3.4 Feed-Forward Network (MLP)
+### 3.4 Feed-Forward Network (SwiGLU)
 
-- `Linear(C, 4C) → GELU → Linear(4C, C) → Dropout(p)`.
-- Expansion factor `4×` is a standard compute/memory tradeoff.
+- `SwiGLU(x) = down( silu(gate(x)) * up(x) )` — three projections
+  (`gate`, `up`: `C → d_ff`; `down`: `d_ff → C`) rather than the two of a GELU MLP.
+- Because SwiGLU uses 3 matrices instead of 2, `d_ff` is conventionally set to
+  ~`8/3 · C` to hold the parameter count level with a `4C` GELU MLP. The default
+  config uses `d_model=512, d_ff=2048` (a `4×` ratio), trading ~1.5× the FFN
+  parameters for the gating quality win at this small scale (TDR-017).
 
 ### 3.5 Transformer Block
 
-- **Pre-LayerNorm:** LayerNorm applied before each sublayer (Pre-LN), improving deep
-  network trainability and reducing warmup sensitivity.
-- **Residual connections** around both sublayers to carry gradients.
+- **Pre-normalisation** with **RMSNorm**: `x = x + attn(norm(x))`, then
+  `x = x + mlp(norm(x))`. Pre-norm improves deep-stack trainability and reduces
+  warmup sensitivity.
+- **RMSNorm** drops the mean-centring and bias of LayerNorm, keeping only the
+  scale: `x · rsqrt(mean(x²) + eps) · weight`. Fewer ops, one fewer reduction
+  pass, no measured quality loss at this scale (TDR-017).
+- **Residual connections** around both sublayers.
 
 ### 3.6 Output Layer
 
-- `nn.Linear(C, V)` produces logits.
+- `nn.Linear(d_model, vocab_size)` produces logits (optionally weight-tied to the
+  token embedding).
 - **Training:** cross-entropy over vocab at each position.
 - **Inference:** softmax over the last position → sampling distribution.
 
-### 3.7 Config Dataclass (`ModelConfig`)
+### 3.7 Configuration
 
-`vocab_size`, `block_size`, `n_layer`, `n_head`, `n_embd`, `dropout`, `bias`,
-`weight_tying` (token embedding reused as head).
+Config is a plain nested dict loaded from `configs/*.yaml` (no dataclass; every
+module reads the dict, per the BUILD_ORDER "config-driven" convention). The
+`model` block is authoritative:
 
-A concrete starter "nano" config (Phase 1/2 smoke testing) and a "base" config are
-defined under `configs/`; sizes target ~1–15M parameters so early iterations fit
-comfortably on CPU and a single consumer GPU.
+`d_model`, `n_layers`, `n_heads`, `n_kv_heads`, `d_ff`, `vocab_size`,
+`max_seq_len`, `rope_theta`, `dropout`.
+
+The `attention` block selects the kernel path: `impl` (`sdpa | flash | manual`)
+and `kv_cache`.
+
+Sizes target ~10–40M parameters so early iterations run comfortably on CPU and
+on Apple Silicon MPS (TDR-019).
 
 ---
 
@@ -301,6 +337,21 @@ is found; never materialize the full `T²` matrix.
 |--------|--------|-----------|-------|
 | Standard | O(T²) | naive | simple |
 | Block/tiled (flash-inspired) | O(T) | tiled, online softmax | exact, memory-scalable |
+
+### 4.3 Selectable Kernel Paths (`attention.impl`)
+
+The config exposes three interchangeable implementations behind one module
+interface, so the same model can be run on whichever path the hardware favours
+and the benchmark layer can compare them directly (TDR-012):
+
+| `impl` | Path | Use |
+|--------|------|-----|
+| `manual` | explicit `QKᵀ`, mask, softmax, `PV` in PyTorch ops | the readable reference; the correctness oracle every other path is tested against |
+| `sdpa` | `torch.nn.functional.scaled_dot_product_attention` | **default.** Dispatches to the best fused backend available (including on Apple MPS); `is_causal=True` avoids materialising the mask |
+| `flash` | our own tiled/online-softmax implementation (§4.2) | the from-scratch demonstration that the `T²` matrix need never be materialised |
+
+All three must produce numerically equivalent output (within fp tolerance) on
+the same inputs — this is a regression test, not an aspiration (§10.4).
 
 ---
 
@@ -451,28 +502,50 @@ API Layer  (programmatic; optional serving interface later)
 ### 8.3 Class Design
 
 ```
-Tokenizer.BPE            Dataset.TokenDataset, Dataset.DataEngine
-Model.MultiHeadAttention, Model.TransformerBlock, Model.GPT, Model.ModelConfig
-Attention.standard_attention, Attention.flash_attention
-Training.AdamW, Training.Scheduler, Training.Trainer, Training.Checkpoint
-Inference.KVCache, Inference.Generator, Inference.Sampler
-Optimization.quantize_fp16, Optimization.quantize_int8, Optimization.MemoryPool
+tokenizer.BPE
+Dataset.TokenDataset, Dataset.PackedTokenDataset, Dataset.DataEngine
+Attention.RotaryEmbedding, Attention.CausalAttention, Attention.KVCache
+Model.TransformerBlock, Model.RMSNorm, Model.SwiGLU, Model.CausalLM
+Training.AdamW, Training.CosineScheduler, Training.Trainer, Training.Checkpoint
+Inference.Sampler, Inference.Generator
+Optimization.quantize
 Benchmark.TrainingBenchmark, Benchmark.InferenceBenchmark
 ```
 
 ### 8.4 Internal API Design
 
-Core contracts:
+These are the canonical contracts, identical to those in
+[`BUILD_ORDER.md`](BUILD_ORDER.md). Change them only via a new TDR.
 
 ```python
 tokenizer.BPE.encode(text) -> list[int]
 tokenizer.BPE.decode(ids)  -> str
-dataset.DataEngine.next_batch(device) -> (x, y)
-model.GPT.forward(x, y)    -> (logits, loss)
-training.Trainer.step()    -> metrics
-inference.Generator.generate(prompt, **sampling) -> str
-optimization.quantize(model, precision) -> model
+
+# dataset — yields dicts, not tuples, so fields can be added without breaking callers
+dataset.TokenDataset.__iter__() -> Iterator[dict]   # {"input_ids": LongTensor[T],
+                                                    #  "labels":    LongTensor[T]}
+dataset.DataEngine.next_batch(device) -> dict       # same keys, batched [B, T]
+
+# attention
+attention.CausalAttention.forward(x, *, kv_cache=None, use_cache=False)
+    -> (out, new_kv_cache)
+
+# model
+model.CausalLM.forward(input_ids, *, kv_cache=None, use_cache=False) -> logits [B,T,V]
+model.CausalLM.from_config(cfg: dict) -> CausalLM
+
+# training / inference / optimization
+training.Trainer.step() -> dict            # metrics
+inference.sample(logits, *, temperature=1.0, top_k=0, top_p=1.0) -> int
+inference.generate(model, tokenizer, prompt, *, max_new_tokens, **sampling) -> str
+optimization.quantize(model, *, bits=8, scheme="int8_weight") -> nn.Module
 ```
+
+> **Loss placement.** `CausalLM.forward` returns logits only; cross-entropy lives
+> in the training loop. This keeps the model pure for inference (where computing
+> a loss is wasted work) and is why the signature differs from the
+> `GPT.forward(x, y) -> (logits, loss)` sketch in earlier revisions of this
+> document.
 
 ---
 
@@ -527,7 +600,7 @@ aggregate throughput, memory footprint (model + KV cache).
 - Map to module first, then entire suite re-run.
 
 **Workflow:** every module: write failing test → implement → refactor. See
-`~/vault/roadmap/` for per-phase checklists.
+`~/.claude/vault/language-model/roadmap/` for per-phase checklists.
 
 ---
 
@@ -547,13 +620,16 @@ language-model-engine/
 ├── configs/        # runnable JSON/configuration files
 ├── checkpoints/    # serialized model/optimizer state
 ├── docs/           # TDD, README, module docs
-├── .github/        # GitHub Actions CI workflows (lint, type, test, smoke)
-└── train.py        # command-line entry point
+└── .github/        # GitHub Actions CI workflows (lint, type, test, smoke)
 ```
 
 Purpose of each directory summarized in the tree above; `tests/` mirrors the
 module tree for maintainability. `.github/workflows/` holds the CI definitions
 (see §16.3).
+
+The command-line entry point is `training/train.py`, invoked as a module
+(`python -m training.train`) rather than a root-level `train.py`, so it resolves
+imports through the same package paths as every other module.
 
 ---
 
@@ -614,12 +690,13 @@ suite. *Exit:* reproducible benchmark report; documentation complete.
 - **Alternatives:** Post-LN, original transformer.
 - **Tradeoffs:** Pre-LN may require weighting for very deep stacks; simpler anyway.
 
-### TDR-006: Learnable Absolute Positional Embeddings
+### TDR-006: Learnable Absolute Positional Embeddings — ⚠️ SUPERSEDED by TDR-015
 - **Decision:** Learnable absolute position table for Phase 1.
 - **Reason:** Simplest correct baseline; acceptable within the fixed `block_size`.
 - **Alternatives:** sinusoidal, Rotary, ALiBi.
-- **Tradeoffs:** No extrapolation beyond `block_size`; Rotary/ALiBi flagged as
-  future optimizations (`~/vault/roadmap/future_improvements.md`).
+- **Tradeoffs:** No extrapolation beyond `block_size`.
+- **Superseded:** never implemented. RoPE was adopted before any positional code
+  was written; see TDR-015. Retained for history.
 
 ### TDR-007: Flash-Attention-Inspired Tiled Attention
 - **Decision:** Block-tiled attention with online softmax.
@@ -648,7 +725,7 @@ suite. *Exit:* reproducible benchmark report; documentation complete.
   setups.
 
 ### TDR-011: Global Knowledge Vault
-- **Decision:** Maintain a global project knowledge vault at `~/vault/` (outside
+- **Decision:** Maintain a global project knowledge vault at `~/.claude/vault/language-model/` (outside
   the repo), as single source of truth for decisions, research, benchmarks.
 - **Reason:** Long-lived engineering memory independent of a single codebase;
   reusable across projects.
@@ -669,7 +746,7 @@ suite. *Exit:* reproducible benchmark report; documentation complete.
 - **Reason:** Keeps `main` production-stable, enables review, auditable history.
 - **Alternatives:** direct-to-main, full git-flow.
 - **Tradeoffs:** Slight overhead (branches/PRs) vs strong safety and review gate.
-  See §16 and `~/vault/decisions/architecture_decisions.md` (ADR-003).
+  See §16 and `~/.claude/vault/language-model/decisions/architecture_decisions.md` (ADR-003).
 
 ### TDR-014: Free-Tier CI (Lint + Type + Tests) Gate
 - **Decision:** GitHub Actions free-tier CI enforcing lint, type check, tests, and
@@ -677,7 +754,71 @@ suite. *Exit:* reproducible benchmark report; documentation complete.
 - **Reason:** Automated, enforced quality gate at zero cost on a public repo.
 - **Alternatives:** local-only checks, paid/self-hosted CI, pre-commit alone.
 - **Tradeoffs:** Runner resource limits vs encrypted, reproducible enforcement.
-  See §16.3 and `~/vault/decisions/architecture_decisions.md` (ADR-004).
+  See §16.3 and `~/.claude/vault/language-model/decisions/architecture_decisions.md` (ADR-004).
+
+### TDR-015: Rotary Position Embeddings (supersedes TDR-006)
+- **Decision:** Inject position via RoPE applied to Q and K inside attention; no
+  positional embedding table.
+- **Reason:** Attention scores become a function of *relative* offset, which
+  generalises better than absolute indices; removes a `max_seq_len × d_model`
+  parameter table; context can be extended post-hoc by rescaling `rope_theta`
+  rather than retraining a table. It is also the current standard (Llama, Qwen,
+  Mistral), so the implementation is a well-understood reference point.
+- **Alternatives:** learnable absolute (TDR-006), sinusoidal, ALiBi.
+- **Tradeoffs:** Position handling moves into the attention hot path and must be
+  correct under KV caching (the offset comes from cache length, not slice index)
+  — an easy bug, hence a dedicated test. Cos/sin tables are cached as
+  non-persistent buffers.
+
+### TDR-016: Grouped-Query Attention
+- **Decision:** `n_kv_heads < n_heads` (default 2 KV heads for 8 query heads);
+  each KV head is shared across a group of query heads.
+- **Reason:** The KV cache — not the weights — dominates decode-time memory, and
+  it scales with `n_kv_heads`. A 4:1 group ratio cuts cache footprint 4× for a
+  quality cost that is negligible at this scale. This matters directly on the
+  target hardware, where unified memory is shared with the rest of the system
+  (TDR-019).
+- **Alternatives:** full MHA (`n_kv_heads == n_heads`), MQA (`n_kv_heads == 1`).
+- **Tradeoffs:** Requires `n_heads % n_kv_heads == 0` and a repeat/expand of KV
+  heads before the attention product; MHA remains reachable by setting
+  `n_kv_heads = n_heads`, so the baseline is one config key away and directly
+  benchmarkable.
+
+### TDR-017: RMSNorm + SwiGLU
+- **Decision:** RMSNorm instead of LayerNorm; SwiGLU FFN instead of GELU MLP.
+- **Reason:** RMSNorm removes mean-centring and bias — one fewer reduction pass
+  and fewer parameters, with no measured quality loss. SwiGLU's multiplicative
+  gate consistently outperforms a plain GELU MLP at equal parameter count.
+- **Alternatives:** LayerNorm + 4C GELU MLP (the GPT-2 baseline).
+- **Tradeoffs:** SwiGLU needs 3 weight matrices instead of 2, so equal-parameter
+  comparison requires `d_ff ≈ 8/3·C`. We keep `d_ff = 4·C` at this scale and
+  accept ~1.5× FFN parameters, noting the deviation rather than hiding it.
+
+### TDR-018: Vault Location — `~/.claude/vault/language-model/`
+- **Decision:** The knowledge vault mandated by TDR-011 lives at
+  `~/.claude/vault/language-model/`, not `~/vault/`.
+- **Reason:** `~/.claude/vault/` is the machine's existing global vault root and
+  is already covered by a standing maintenance rule; adding a second vault at
+  `~/vault/` would split the source of truth. Every `~/vault/...` reference in
+  this repo pointed at a directory that did not exist.
+- **Alternatives:** create `~/vault/` as originally specified; move the vault
+  in-repo under `docs/`.
+- **Tradeoffs:** Still outside git (the TDR-011 tradeoff is unchanged), but now
+  it actually exists and has one unambiguous location.
+
+### TDR-019: Apple Silicon (MPS) as the Primary Development Target
+- **Decision:** Develop and validate on Apple Silicon via the `mps` backend,
+  with CPU as the always-correct fallback and CUDA as an untested-but-supported
+  path. Device selection is `mps → cuda → cpu`, overridable by config.
+- **Reason:** It is the hardware this project is actually built on, so it is the
+  only device whose numbers we can honestly report. Verified available:
+  torch 2.13, bf16 tensors, and fused `scaled_dot_product_attention`.
+- **Alternatives:** CPU-only development; rented CUDA.
+- **Tradeoffs:** MPS has real gaps — no `torch.cuda.max_memory_allocated`
+  equivalent for peak-memory metrics, `GradScaler` is a CUDA concept (bf16 on
+  MPS needs no loss scaling), and some ops silently fall back to CPU. The
+  benchmark layer must therefore report *per-device* numbers and never present
+  an MPS measurement as a general claim (TDR-012).
 
 ---
 
@@ -685,10 +826,10 @@ suite. *Exit:* reproducible benchmark report; documentation complete.
 
 Per the project requirements, all long-lived decisions, architecture, research,
 experiments, roadmap, and implementation notes are stored in a **global**, modular
-knowledge vault at **`~/vault/`** (available across projects):
+knowledge vault at **`~/.claude/vault/language-model/`** (available across projects):
 
 ```
-~/vault/
+~/.claude/vault/language-model/
 ├── architecture/    system_design, model_architecture, component_design, data_flow
 ├── decisions/       architecture_decisions, optimization_decisions, tradeoffs
 ├── research/        transformer_notes, attention_optimization, inference_optimization, papers
@@ -714,7 +855,7 @@ decisions, noting alignment/conflict.
 - Inference engine (KV cache, sampling, batching).
 - Optimization layer (fp16/int8 quantization, memory pooling).
 - Benchmarking framework and TDD test suite.
-- Global knowledge vault at `~/vault/`.
+- Global knowledge vault at `~/.claude/vault/language-model/`.
 
 ---
 
@@ -738,7 +879,7 @@ following engineering process governs how work is delivered.
 - Every task/feature/bug/optimization is tracked as a **GitHub Issue**.
 - Feature branches and PRs reference the issue they address; PRs close issues with
   `Closes #N`.
-- Work items map back to the vault roadmap (`~/vault/roadmap/milestones.md`) for
+- Work items map back to the vault roadmap (`~/.claude/vault/language-model/roadmap/milestones.md`) for
   traceability between design, implementation, and delivery.
 
 ### 16.3 CI/CD (Free-Tier GitHub Actions)
@@ -778,7 +919,7 @@ In addition to the functional deliverables in §15, the project delivers:
 
 - A locked-`main`, PR-gated **branch workflow** with **GitHub Issue tracking**.
 - **Free-tier CI** (lint + type check + tests + import smoke) enforced on PRs.
-- A **global knowledge vault** (`~/vault/`) kept current with decisions,
+- A **global knowledge vault** (`~/.claude/vault/language-model/`) kept current with decisions,
   milestones, and results, acting as the single source of truth.
 
 ---

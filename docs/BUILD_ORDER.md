@@ -1,8 +1,8 @@
 # Build Order & Module Interfaces
 
 Dependency-aware implementation plan for the remaining modules. Each stage is
-independently testable and unblocks the next. The architecture is the
-vault/TDD design; this document is the *sequencing* and the *contracts* that
+independently testable and unblocks the next. The architecture is specified in
+[`TDD.md`](TDD.md); this document is the *sequencing* and the *contracts* that
 keep the modules decoupled.
 
 ## Dependency graph
@@ -72,7 +72,7 @@ def quantize(model, *, bits: int = 8, scheme: str = "int8_weight") -> nn.Module:
 ## Conventions
 
 - **Config-driven**: every module reads from the loaded YAML dict (see `configs/default.yaml`); no magic constants.
-- **tokenizer representation** is GPT-2 style rendered-unicode (see ADR in vault). Raw bytes only at the UTF-8 boundary via `token_bytes()`.
+- **tokenizer representation** is GPT-2 style rendered-unicode (TDR-002). Raw bytes only at the UTF-8 boundary via `token_bytes()`.
 - **KV cache** is the canonical inference path; training never uses it.
 - **TDD**: write the exit test in `tests/unit/` *before* implementing each stage.
 - One module = one public API (exported in its `__init__.py`).
