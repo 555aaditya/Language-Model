@@ -13,6 +13,7 @@ expanded, and must return identical output within floating-point tolerance —
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -93,7 +94,7 @@ def sdpa_attention(
     )
 
 
-def flash_attention(
+def _flash_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -102,8 +103,12 @@ def flash_attention(
     offset: int = 0,
     block_q: int = 64,
     block_k: int = 64,
-) -> torch.Tensor:
-    """Tiled attention with online softmax (TDR-007).
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tiled forward pass. Returns ``(out, logsumexp)``.
+
+    The log-sum-exp per query row is the *only* extra state the backward pass
+    needs. It is O(T) — one scalar per query — which is what lets backward
+    recompute the score tiles instead of the forward saving them (TDR-021).
 
     Walks query tiles on the outside and key tiles on the inside, carrying a
     running max ``m`` and running denominator ``l`` per query row. When a key
@@ -125,6 +130,7 @@ def flash_attention(
     k_len = k.shape[-2]
     scale = 1.0 / math.sqrt(head_dim)
     out = torch.empty_like(q)
+    lse = torch.empty((*q.shape[:-1], 1), device=q.device, dtype=q.dtype)
 
     for i in range(0, q_len, block_q):
         q_tile = q[:, :, i : i + block_q]
@@ -166,6 +172,151 @@ def flash_attention(
         # Causal attention always leaves a row at least its own key, so the
         # denominator is positive; clamp only to keep a degenerate all-masked
         # call from producing NaN instead of zeros.
-        out[:, :, i : i + tile_q] = acc / running_sum.clamp_min(torch.finfo(q.dtype).tiny)
+        denom = running_sum.clamp_min(torch.finfo(q.dtype).tiny)
+        out[:, :, i : i + tile_q] = acc / denom
+        # log-sum-exp in the original (unshifted) score space, so backward can
+        # rebuild the exact probabilities without knowing the tile order.
+        lse[:, :, i : i + tile_q] = running_max + torch.log(denom)
 
+    return out, lse
+
+
+def _flash_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    causal: bool = True,
+    offset: int = 0,
+    block_q: int = 64,
+    block_k: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Recompute score tiles and accumulate ``dq``, ``dk``, ``dv`` (TDR-021).
+
+    With ``L`` (the saved log-sum-exp) the probabilities are recoverable exactly:
+    ``p_ij = exp(s_ij - L_i)``, no running max needed. Differentiating
+    ``o_i = Σ_j p_ij v_j`` then gives
+
+        D_i   = Σ_j p_ij (do_i · v_j) = do_i · o_i
+        dv_j += Σ_i p_ij do_i
+        dp_ij = do_i · v_j
+        ds_ij = p_ij (dp_ij − D_i)
+        dq_i += scale Σ_j ds_ij k_j
+        dk_j += scale Σ_i ds_ij q_i
+
+    ``D_i`` collapses to a row-wise dot product of ``dout`` and ``out``, which is
+    why the forward only has to keep ``out`` and ``L`` — the ``T × T`` matrices
+    ``p``, ``dp`` and ``ds`` exist one tile at a time and are discarded.
+    """
+    head_dim = q.shape[-1]
+    scale = 1.0 / math.sqrt(head_dim)
+    q_len, k_len = q.shape[-2], k.shape[-2]
+
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    row_dot = (dout * out).sum(dim=-1, keepdim=True)  # D_i
+
+    for i in range(0, q_len, block_q):
+        span_q = slice(i, i + block_q)
+        q_tile = q[:, :, span_q]
+        dout_tile = dout[:, :, span_q]
+        lse_tile = lse[:, :, span_q]
+        dot_tile = row_dot[:, :, span_q]
+        tile_q = q_tile.shape[2]
+        q_pos = torch.arange(i, i + tile_q, device=q.device) + offset
+        dq_tile = torch.zeros_like(q_tile)
+
+        for j in range(0, k_len, block_k):
+            if causal and j > int(q_pos[-1].item()):
+                break
+
+            span_k = slice(j, j + block_k)
+            k_tile = k[:, :, span_k]
+            v_tile = v[:, :, span_k]
+
+            scores = torch.matmul(q_tile, k_tile.transpose(-2, -1)) * scale
+            if causal:
+                k_pos = torch.arange(j, j + k_tile.shape[2], device=q.device)
+                scores = scores.masked_fill(k_pos[None, :] > q_pos[:, None], float("-inf"))
+
+            probs = torch.exp(scores - lse_tile)
+            dv[:, :, span_k] += torch.matmul(probs.transpose(-2, -1), dout_tile)
+
+            dprobs = torch.matmul(dout_tile, v_tile.transpose(-2, -1))
+            dscores = probs * (dprobs - dot_tile)
+
+            dq_tile += torch.matmul(dscores, k_tile) * scale
+            dk[:, :, span_k] += torch.matmul(dscores.transpose(-2, -1), q_tile) * scale
+
+        dq[:, :, span_q] = dq_tile
+
+    return dq, dk, dv
+
+
+class FlashAttentionFn(torch.autograd.Function):
+    """Autograd wrapper that keeps the O(T) memory claim true in *training*.
+
+    Without this, the tiled kernel is plain PyTorch ops, so autograd saves every
+    tile's intermediates for backward — and the tiles sum back to O(T²). Measured
+    before this change: the tiled path saved *more* than the naive one (1.30×
+    at T=512) and both grew quadratically, so the memory advantage existed only
+    under ``no_grad``.
+
+    Saving ``(q, k, v, out, lse)`` and recomputing the score tiles in backward
+    trades a second pass over the tiles for O(T·d) saved state instead of O(T²).
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool,
+        offset: int,
+        block_q: int,
+        block_k: int,
+    ) -> torch.Tensor:
+        out, lse = _flash_forward(
+            q, k, v, causal=causal, offset=offset, block_q=block_q, block_k=block_k
+        )
+        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.causal, ctx.offset = causal, offset
+        ctx.block_q, ctx.block_k = block_q, block_k
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, dout: torch.Tensor) -> tuple[Any, ...]:  # type: ignore[override]
+        q, k, v, out, lse = ctx.saved_tensors
+        dq, dk, dv = _flash_backward(
+            dout.contiguous(),
+            q,
+            k,
+            v,
+            out,
+            lse,
+            causal=ctx.causal,
+            offset=ctx.offset,
+            block_q=ctx.block_q,
+            block_k=ctx.block_k,
+        )
+        return dq, dk, dv, None, None, None, None
+
+
+def flash_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool = True,
+    offset: int = 0,
+    block_q: int = 64,
+    block_k: int = 64,
+) -> torch.Tensor:
+    """Tiled attention with online softmax and a recomputing backward (TDR-007, TDR-021)."""
+    out: torch.Tensor = FlashAttentionFn.apply(q, k, v, causal, offset, block_q, block_k)
     return out

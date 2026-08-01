@@ -346,6 +346,84 @@ def test_flash_never_materialises_the_full_score_matrix():
 # ---------------------------------------------------------------------------
 
 
+def _saved_bytes(attn, seq_len):
+    """Bytes autograd retains for backward — the quantity TDR-021 is about."""
+    total = 0
+
+    def pack(t):
+        nonlocal total
+        total += t.numel() * t.element_size()
+        return t
+
+    with torch.enable_grad(), torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        attn(torch.randn(1, seq_len, D_MODEL))
+    return total
+
+
+def test_flash_gradients_match_the_manual_oracle():
+    """The custom backward must be exact, not merely plausible (TDR-021).
+
+    Computed in float64 so the comparison is about the derivation, not about
+    float32 noise. A sign error or a missing scale factor still trains -- just
+    toward a slightly different objective than the one written down.
+    """
+    from attention.kernels import causal_block_mask, flash_attention, manual_attention
+
+    torch.manual_seed(0)
+    shape = (2, 3, 37, 16)  # deliberately not a multiple of the block size
+
+    def leaves():
+        return [torch.randn(*shape, dtype=torch.float64, requires_grad=True) for _ in range(3)]
+
+    q, k, v = leaves()
+    qf, kf, vf = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
+
+    reference = manual_attention(q, k, v, mask=causal_block_mask(37, 37, 0, q.device))
+    tiled = flash_attention(qf, kf, vf, causal=True, block_q=8, block_k=8)
+    torch.testing.assert_close(tiled, reference, rtol=1e-10, atol=1e-12)
+
+    seed = torch.randn_like(reference)
+    reference.backward(seed)
+    tiled.backward(seed)
+    for name, want, got in (
+        ("dq", q.grad, qf.grad),
+        ("dk", k.grad, kf.grad),
+        ("dv", v.grad, vf.grad),
+    ):
+        torch.testing.assert_close(got, want, rtol=1e-9, atol=1e-11, msg=f"{name} mismatch")
+
+
+def test_flash_saved_activations_grow_linearly_not_quadratically():
+    """The O(T) memory claim, asserted for *training* rather than inference.
+
+    Before the custom backward, the tiled kernel was plain autograd ops, so every
+    tile's intermediates were retained and summed back to O(T^2) -- it measured
+    1.30x *worse* than the naive path. Recomputing scores in backward means only
+    (q, k, v, out, lse) are kept.
+    """
+    attn = make_attn(impl="flash", max_seq_len=2048, block_q=32, block_k=32)
+    torch.manual_seed(0)
+    small = _saved_bytes(attn, 256)
+    large = _saved_bytes(attn, 512)
+    # Linear would be 2.0x; quadratic 4.0x. Allow slack for fixed overheads.
+    assert large / small < 2.6, f"doubling T cost {large / small:.2f}x saved memory"
+
+
+def test_flash_retains_far_less_than_manual_for_training():
+    torch.manual_seed(0)
+    manual = _saved_bytes(make_attn(impl="manual", max_seq_len=2048), 512)
+    flash = _saved_bytes(make_attn(impl="flash", max_seq_len=2048, block_q=32, block_k=32), 512)
+    assert flash < manual / 4, f"flash {flash} vs manual {manual} bytes"
+
+
+def test_manual_saved_activations_are_quadratic():
+    """Pins the baseline the comparison above is against."""
+    attn = make_attn(impl="manual", max_seq_len=2048)
+    torch.manual_seed(0)
+    ratio = _saved_bytes(attn, 512) / _saved_bytes(attn, 256)
+    assert ratio > 3.0, f"expected ~4x for the naive path, got {ratio:.2f}x"
+
+
 @pytest.mark.parametrize("impl", ALL_IMPLS)
 def test_gradients_reach_every_projection(impl, x):
     attn = make_attn(impl=impl)
