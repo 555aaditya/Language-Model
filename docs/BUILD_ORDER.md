@@ -27,16 +27,16 @@ tokenizer ──► dataset ──► training ──► checkpoints ──► i
 
 | # | Module | Depends on | Deliverable | Exit test |
 |---|--------|-----------|-------------|-----------|
-| 0 | **tokenizer** ✅ | — | `BPE` with train/encode/decode/save/load | 14 unit tests |
-| 1 | **dataset** ✅ | tokenizer | mmap + streaming datasets → dict batches | 29 unit tests |
-| 2 | **attention** ✅ | config | causal GQA + RoPE + KV cache, 3 kernels | 39 unit tests |
+| 0 | **tokenizer** ✅ | — | `BPE` + GPT-2 pre-tokenization, piece cache | 54 unit tests |
+| 1 | **dataset** ✅ | tokenizer | mmap/streaming datasets, corpus download, document split | 76 unit tests |
+| 2 | **attention** ✅ | config | causal GQA + RoPE + KV cache, 3 kernels + recomputing backward | 43 unit tests |
 | 3 | **model** ✅ | attention | `CausalLM` (embed → blocks → RMSNorm → LM head) | 25 unit tests |
 | 4 | **training** ✅ | dataset + model | AdamW + cosine + AMP loop | 58 unit tests (incl. overfit-one-batch) |
-| 5 | **inference** ✅ | model ckpt | greedy / top-k / top-p sampling | 29 unit tests |
+| 5 | **inference** ✅ | model ckpt | greedy / top-k / top-p, cached + batched generation | 29 unit tests |
 | 6 | **optimization** ✅ | model ckpt | int8/int4 per-channel quant + preallocated KV arena | 38 unit tests (incl. perplexity-within-tolerance) |
 | 7 | **benchmark** ✅ | all | latency / throughput / memory harness | 18 unit tests (incl. baseline reproduction) |
 
-> All 8 stages are implemented (264 tests).
+> All 8 stages are implemented (371 tests).
 
 ## Contracts (stable interfaces — change only via ADR)
 
@@ -50,12 +50,16 @@ class TokenDataset(IterableDataset):
 
 # attention
 class CausalAttention(nn.Module):
-    def forward(self, x, *, kv_cache=None, use_cache=False): ...  # -> (out, new_kv_cache)
+    def forward(
+        self, x, *, kv_cache=None, use_cache=False, key_padding_mask=None
+    ): ...  # -> (out, new_kv_cache)
 
 
 # model
 class CausalLM(nn.Module):
-    def forward(self, input_ids, *, kv_cache=None, use_cache=False): ...  # -> logits [B, T, V]
+    def forward(
+        self, input_ids, *, kv_cache=None, use_cache=False, key_padding_mask=None
+    ): ...  # -> logits [B, T, V]
     def new_cache(self) -> list[KVCache]: ...  # one entry per layer
     @classmethod
     def from_config(cls, cfg: dict) -> "CausalLM": ...
