@@ -21,6 +21,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from benchmark.memory import gqa_saving_report, model_memory_report
 from model import CausalLM
@@ -117,7 +118,125 @@ def show_latency(model: CausalLM) -> None:
         )
 
 
-def measure_perplexity(model: CausalLM, cfg: dict, val_path: str, batches: int) -> float:
+def show_kernel_equivalence(cfg: dict) -> None:
+    """Prove the three attention kernels agree, rather than assert it.
+
+    An optimised kernel with no reference to check against is not trustworthy.
+    `manual` is the readable oracle; the other two have to match it.
+    """
+    import torch
+
+    from attention import CausalAttention
+    from attention.kernels import causal_block_mask, flash_attention, manual_attention
+
+    header("KERNEL EQUIVALENCE — three implementations, one answer")
+    m = cfg["model"]
+    torch.manual_seed(0)
+    reference = CausalAttention(
+        int(m["d_model"]),
+        int(m["n_heads"]),
+        int(m["n_kv_heads"]),
+        max_seq_len=int(m["max_seq_len"]),
+        impl="manual",
+    ).eval()
+    x = torch.randn(2, 64, int(m["d_model"]))
+
+    baseline, _ = reference(x)
+    print(f"  {'kernel':<10}{'max abs diff vs manual':>26}")
+    for impl in ("manual", "sdpa", "flash"):
+        torch.manual_seed(0)
+        other = CausalAttention(
+            int(m["d_model"]),
+            int(m["n_heads"]),
+            int(m["n_kv_heads"]),
+            max_seq_len=int(m["max_seq_len"]),
+            impl=impl,
+        ).eval()
+        other.load_state_dict(reference.state_dict())
+        out, _ = other(x)
+        print(f"  {impl:<10}{(out - baseline).abs().max().item():>26.2e}")
+
+    # Gradient check in float64: float32 noise hides sign and scale errors in a
+    # hand-written backward.
+    shape = (2, 3, 37, 16)
+    q, k, v = (torch.randn(*shape, dtype=torch.float64, requires_grad=True) for _ in range(3))
+    qf, kf, vf = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
+    ref = manual_attention(q, k, v, mask=causal_block_mask(37, 37, 0, q.device))
+    tiled = flash_attention(qf, kf, vf, causal=True, block_q=8, block_k=8)
+    seed = torch.randn_like(ref)
+    ref.backward(seed)
+    tiled.backward(seed)
+    pairs = ((q, qf), (k, kf), (v, vf))
+    assert all(a.grad is not None and b.grad is not None for a, b in pairs)
+    worst = max(
+        (a.grad - b.grad).abs().max().item()  # type: ignore[operator]
+        for a, b in pairs
+    )
+    print(f"\n  hand-written flash backward vs autograd (float64): {worst:.2e}")
+
+
+def show_flash_memory(cfg: dict) -> None:
+    """The O(T) memory claim, measured for *training* rather than inference."""
+    import torch
+
+    from attention import CausalAttention
+
+    header("TILED ATTENTION MEMORY — bytes autograd retains for backward")
+    d_model = int(cfg["model"]["d_model"])
+
+    def retained(impl: str, seq_len: int) -> int:
+        torch.manual_seed(0)
+        attn = CausalAttention(
+            d_model, 4, 2, max_seq_len=4096, impl=impl, block_q=32, block_k=32
+        ).eval()
+        total = 0
+
+        def pack(t: torch.Tensor) -> torch.Tensor:
+            nonlocal total
+            total += t.numel() * t.element_size()
+            return t
+
+        with torch.enable_grad(), torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            attn(torch.randn(1, seq_len, d_model))
+        return total
+
+    print(
+        f"  {'T':>6}{'standard':>14}{'tiled':>12}{'ratio':>9}{'std growth':>13}{'tiled growth':>15}"
+    )
+    prev_std = prev_tiled = None
+    for seq_len in (128, 256, 512, 1024):
+        std, tiled = retained("manual", seq_len), retained("flash", seq_len)
+        g_std = f"{std / prev_std:.2f}x" if prev_std else "—"
+        g_tiled = f"{tiled / prev_tiled:.2f}x" if prev_tiled else "—"
+        print(
+            f"  {seq_len:>6}{std / 1024:>11.0f} KiB{tiled / 1024:>9.0f} KiB"
+            f"{tiled / std:>8.2f}x{g_std:>13}{g_tiled:>15}"
+        )
+        prev_std, prev_tiled = std, tiled
+    print("\n  2.0x per doubling is linear; 4.0x is quadratic.")
+    print("  Before the custom backward the tiled path retained 1.30x MORE than standard.")
+
+
+def show_quantization(model: CausalLM, cfg: dict, val_path: str | None, batches: int) -> None:
+    """Compression against its actual cost in held-out perplexity."""
+    from optimization import model_nbytes, quantize
+
+    header("QUANTIZATION — compression against measured quality cost")
+    fp32_bytes = model_nbytes(model)
+    print(f"  {'precision':<12}{'size':>12}{'compression':>14}{'held-out ppl':>16}")
+    for label, bits in (("fp32", None), ("int8", 8), ("int4", 4)):
+        target: nn.Module = model if bits is None else quantize(model, bits=bits)
+        size = model_nbytes(target)
+        ppl = (
+            f"{measure_perplexity(target, cfg, val_path, batches):.1f}"
+            if val_path
+            else "not measured"
+        )
+        print(f"  {label:<12}{size / (1024 * 1024):>9.2f} MiB{fp32_bytes / size:>13.2f}x{ppl:>16}")
+    print("\n  Weight-only: buys memory, not speed. Real int8 throughput needs fused kernels.")
+
+
+def measure_perplexity(model: nn.Module, cfg: dict, val_path: str, batches: int) -> float:
     """Evaluate held-out perplexity here and now, rather than accept a number.
 
     A figure typed in on the command line is indistinguishable from one that was
@@ -178,6 +297,11 @@ def main() -> None:
     )
     parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--skip-latency", action="store_true")
+    parser.add_argument(
+        "--evidence",
+        action="store_true",
+        help="print kernel equivalence, tiled-attention memory and quantization cost",
+    )
     args = parser.parse_args()
 
     from training.train import load_config
@@ -201,6 +325,10 @@ def main() -> None:
     show_memory(model, cfg)
     if not args.skip_latency:
         show_latency(model)
+    if args.evidence:
+        show_kernel_equivalence(cfg)
+        show_flash_memory(cfg)
+        show_quantization(model, cfg, args.val_path, args.eval_batches)
 
     val_ppl = None
     if args.val_path and Path(args.val_path).exists():
