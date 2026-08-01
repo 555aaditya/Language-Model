@@ -114,12 +114,22 @@ valid string key (avoids collisions with special-token text).
 
 ### 1.6 Performance Optimizations
 
-- **Single-pass tokenization:** base byte mapping via the precomputed rendering
-  table (a `bytes.translate`-style lookup), not a per-byte Python loop.
-- **Rank-driven greedy merge:** iterate merges in rank order over a slice/list to
-  avoid an `O(n²)` scan per merge; use a heap of candidate pairs.
-- Special-token detection front-loaded before byte merging so the hot merge loop
-  never branches on specials.
+Implemented (TDR-020), with measured effect:
+
+- **Pre-tokenization.** Merges run within pieces of ~1-20 bytes, not over whole
+  documents, so the quadratic merge term becomes a small constant.
+- **Piece cache.** Natural text repeats pieces heavily, so after warmup most of
+  a corpus costs one dict lookup. Measured: `encode()` 2.9 KB/s → 67 MB/s.
+- **All occurrences per pass.** Each merge pass rewrites every occurrence of the
+  winning pair, rather than one occurrence followed by a full rescan.
+- **Merged id stored in the merge table.** The hot loop never re-renders a token
+  key or hashes a long string to find the id it just decided on.
+- **Incremental training index.** A pair → containing-pieces index means each
+  merge revisits only the pieces it affects: O(merges x affected pieces) rather
+  than O(merges x corpus). Measured: 4096-token vocabulary over 390 KB in 0.4 s.
+- **Special tokens split off first**, by regex alternation ordered longest-first,
+  so the merge loop never branches on them and a special token can never be
+  shadowed by its own prefix.
 
 ### 1.7 Design Tradeoffs
 
@@ -327,8 +337,11 @@ is found; never materialize the full `T²` matrix.
 
 **Implementation challenges:**
 - Online rescaling adds complexity (must carry `m`, `l` accumulators).
-- Backward pass requires recomputing scores or caching `P = softmax(QKᵀ)`
-  per block.
+- Backward pass requires recomputing scores or caching `P = softmax(QKᵀ)` per
+  block. **We recompute** (TDR-021): the forward saves only the per-row
+  log-sum-exp, and backward rebuilds each score tile from it. Relying on
+  autograd instead silently restores O(T²), because every tile's intermediates
+  are retained.
 - Block granule tuning (`BLOCK_M`, `BLOCK_N`) and boundary padding.
 
 **Tradeoff matrix:**
@@ -336,7 +349,20 @@ is found; never materialize the full `T²` matrix.
 | Scheme | Memory | Complexity | Notes |
 |--------|--------|-----------|-------|
 | Standard | O(T²) | naive | simple |
-| Block/tiled (flash-inspired) | O(T) | tiled, online softmax | exact, memory-scalable |
+| Block/tiled (flash-inspired) | O(T) | tiled, online softmax + recomputing backward | exact, memory-scalable |
+
+Measured retained-activation bytes for a 4-head, 64-dim layer (the figure that
+matters for training, not just inference):
+
+| T | standard | tiled | ratio |
+|---|---|---|---|
+| 128 | 800 KiB | 306 KiB | 0.38× |
+| 256 | 2,640 KiB | 596 KiB | 0.23× |
+| 512 | 9,488 KiB | 1,176 KiB | 0.12× |
+| 1024 | 35,856 KiB | 2,336 KiB | **0.07×** |
+
+Growth per doubling: **1.97–1.99×** tiled (linear) versus **3.3–3.8×** standard
+(quadratic).
 
 ### 4.3 Selectable Kernel Paths (`attention.impl`)
 
@@ -819,6 +845,59 @@ suite. *Exit:* reproducible benchmark report; documentation complete.
   MPS needs no loss scaling), and some ops silently fall back to CPU. The
   benchmark layer must therefore report *per-device* numbers and never present
   an MPS measurement as a general claim (TDR-012).
+
+### TDR-020: Pre-tokenization Before BPE Merges
+- **Decision:** Split text on a GPT-2-style regex before merging, and never let
+  a merge cross a piece boundary. Cache piece → ids.
+- **Reason:** Two things, one of which is a hard blocker. (1) **Tractability.**
+  Merging is quadratic in the length of the sequence it runs over; applied to
+  whole documents, `encode()` measured 4.0x slower per 2x input — 50 KB/s at
+  1 KB falling to 2.9 KB/s at 16 KB — which makes any real corpus unusable
+  (a 515 MB corpus would not finish). Restricted to pieces of ~1-20 bytes with
+  a cache, the same path measures **67 MB/s**, and training a 4096-token
+  vocabulary dropped from ~10 s per 117 KB to 0.4 s per 390 KB. (2) **Quality.**
+  It stops the vocabulary being spent on cross-word artefacts like `"e c"`.
+  Compression *improved* as a side effect, 3.51 → 4.14 chars/token.
+- **Alternatives:** keep whole-document merging and chunk the input (caps the
+  quadratic term but leaves ~48 h for 515 MB, and chunk boundaries become
+  arbitrary token boundaries); rewrite the merge loop with a pair heap but no
+  pre-tokenization (fixes speed, not quality, and the cache stays invalid).
+- **Tradeoffs:** This **changes tokenizer output** — it is not a transparent
+  optimization. Vocabularies trained before it are not interchangeable with
+  vocabularies trained after it, and `save()` gained a `version` field so a
+  stale file is identifiable. The pattern must also *tile the input exactly*: a
+  gap silently drops characters, so `tiles_exactly()` and
+  `test_pattern_tiles_every_input` assert coverage directly rather than trusting
+  round-trip tests to notice. Finally, the stdlib `re` module lacks `\p{L}`, so
+  the letter class is `[^\W\d]`, which groups underscore with letters — a
+  deliberate deviation from GPT-2 taken to avoid a third-party `regex`
+  dependency.
+
+### TDR-021: Recomputing Backward for the Tiled Attention Kernel
+- **Decision:** Implement the tiled kernel as a `torch.autograd.Function` that
+  saves only `(q, k, v, out, logsumexp)` and **recomputes** the score tiles in
+  the backward pass.
+- **Reason:** Without it the O(T) memory claim was false in training and I had
+  published it anyway. As plain PyTorch ops, autograd retained every tile's
+  intermediates, and the tiles summed back to O(T²) — measured, the tiled path
+  retained **1.30× more** than the naive one at T=512 and both grew
+  quadratically. The advantage existed only under `no_grad`. Saving the per-row
+  log-sum-exp (O(T), one scalar per query) is enough to reconstruct the exact
+  probabilities in backward, so the T×T matrices `p`, `dp` and `ds` exist one
+  tile at a time. After the change: retained memory grows **1.97–1.99× per 2× T**
+  (linear) against **3.3–3.8×** for the naive path, and at T=1024 it retains
+  2.3 MiB versus 35.9 MiB — 15× less.
+- **Alternatives:** retract the claim and document the kernel as inference-only
+  (cheap, but leaves a tiled kernel with no reason to exist during training);
+  `torch.utils.checkpoint` around standard attention (recomputes the *whole*
+  attention rather than per-tile, and still materialises T² transiently).
+- **Tradeoffs:** Backward now costs a second pass over the tiles, so it trades
+  compute for memory — the standard FlashAttention bargain. The custom Function
+  is not double-differentiable (no `create_graph` support), which is fine for
+  first-order training but would need `once_differentiable` semantics or a
+  hand-written double backward otherwise. Correctness can no longer be inferred
+  from autograd, so it is pinned against the manual oracle in float64
+  (`test_flash_gradients_match_the_manual_oracle`, agreeing to ~1e-15).
 
 ---
 
