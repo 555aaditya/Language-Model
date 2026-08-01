@@ -82,6 +82,10 @@ def gqa_saving_report(
         "saving_ratio": round(mha / gqa, 4),
         "n_heads": n_heads,
         "n_kv_heads": n_kv_heads,
+        # Echoed back because a cache size is uninterpretable without the length
+        # and batch it was computed at.
+        "seq_len": seq_len,
+        "batch_size": batch_size,
     }
 
 

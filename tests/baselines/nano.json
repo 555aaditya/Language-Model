@@ -18,13 +18,15 @@
     "vocab_size": 64
   },
   "gqa_kv_cache": {
+    "batch_size": 1,
     "gqa_bytes": 8192,
     "gqa_mib": 0.0078,
     "mha_bytes": 16384,
     "mha_mib": 0.0156,
     "n_heads": 4,
     "n_kv_heads": 2,
-    "saving_ratio": 2.0
+    "saving_ratio": 2.0,
+    "seq_len": 32
   },
   "model_memory": {
     "bytes": {
