@@ -5,11 +5,16 @@
 #   python -m dataset.prepare_corpus --corpus tinyshakespeare --vocab-size 8192
 #   python -m training.train --config configs/tinyshakespeare.yaml
 #
-# Sized to finish in minutes rather than hours, so it is a real end-to-end run
-# you can watch. It is still far past Chinchilla-optimal for the corpus
-# (310k tokens against the ~250M a 20M-parameter model wants), so expect the
-# validation curve to turn upward well before the training curve does — that
-# divergence is the point of having a held-out split, not a failure.
+# Sized from a measured run rather than guessed. The first attempt at 2000 steps
+# was 41.6 epochs over a 295k-token corpus at 26 parameters per token: training
+# loss fell 5.26 -> 1.86 while validation perplexity bottomed at 98.9 around
+# step 500 and then climbed to 304.6. The model was memorising, and because
+# checkpoints were periodic the best weights were never saved.
+#
+# So: fewer steps, evaluate 2.5x more often, save on improvement, and stop early
+# when four consecutive evaluations fail to improve. Expect validation to turn
+# upward before training does — with a corpus this small that is arithmetic, not
+# a bug, and it is exactly what the held-out split is for.
 
 seed: 42
 device: auto            # auto | mps | cuda | cpu
@@ -39,7 +44,7 @@ dataset:
   num_workers: 0
 
 training:
-  steps: 2000
+  steps: 800
   lr: 6.0e-4
   min_lr: 6.0e-5
   warmup_steps: 100
@@ -49,7 +54,8 @@ training:
   amp_dtype: bfloat16
   grad_accum_steps: 1
   log_every: 100
-  eval_every: 250
+  eval_every: 100
   eval_batches: 20
-  ckpt_every: 1000
+  early_stop_patience: 4
+  ckpt_every: 0           # best.pt is saved on improvement instead
   out_dir: checkpoints/tinyshakespeare

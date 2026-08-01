@@ -66,6 +66,11 @@ class Trainer:
         self.total_steps = int(t.get("steps", 0))
         self.log_every = int(t.get("log_every", 50))
         self.step_count = 0
+        # Best-validation tracking, so a run can keep its best weights rather
+        # than only its most recent ones.
+        self.best_val_loss = float("inf")
+        self.best_step = -1
+        self.evals_since_improvement = 0
 
         decay, no_decay = build_param_groups(model, float(t.get("weight_decay", 0.0)))
         self.optimizer = AdamW(
@@ -179,6 +184,14 @@ class Trainer:
         the mean of exponentials is not the exponential of the mean (Jensen), so
         per-batch averaging reports a number that is always too high.
 
+        Also tracks the best validation loss seen and how many evaluations have
+        passed without improvement, which is what makes best-checkpoint saving
+        and early stopping possible. Without it a run happily trains past its own
+        optimum and keeps only the *worst* model: the first TinyShakespeare run
+        bottomed out at validation perplexity 98.9 around step 500 and finished at
+        304.6, and because checkpoints were periodic rather than
+        best-tracked, the good weights were never written to disk.
+
         Restores the previous train/eval mode so this can be called mid-loop
         without silently leaving dropout off for the rest of training.
         """
@@ -189,9 +202,34 @@ class Trainer:
             for _ in range(batches):
                 total += self.loss_on(engine.next_batch(self.device)).item()
             mean = total / max(1, batches)
-            return {"val_loss": mean, "val_perplexity": math.exp(min(mean, 80.0))}
+
+            improved = mean < self.best_val_loss
+            if improved:
+                self.best_val_loss = mean
+                self.best_step = self.step_count
+                self.evals_since_improvement = 0
+            else:
+                self.evals_since_improvement += 1
+
+            return {
+                "val_loss": mean,
+                "val_perplexity": math.exp(min(mean, 80.0)),
+                "val_improved": float(improved),
+                "best_val_loss": self.best_val_loss,
+                "best_step": float(self.best_step),
+                "evals_since_improvement": float(self.evals_since_improvement),
+            }
         finally:
             self.model.train(was_training)
+
+    def should_stop_early(self, patience: int) -> bool:
+        """True once ``patience`` consecutive evaluations have failed to improve.
+
+        ``patience <= 0`` disables the check. Patience is counted in
+        *evaluations*, not steps, so it means the same thing regardless of how
+        often the loop evaluates.
+        """
+        return patience > 0 and self.evals_since_improvement >= patience
 
     # ------------------------------------------------------------------
     # Checkpointing
