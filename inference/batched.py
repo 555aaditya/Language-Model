@@ -15,6 +15,15 @@ Two things make batching more than a reshape:
   keeps being fed (the KV cache is one contiguous block; you cannot cheaply
   remove a row mid-flight) but its output is masked to the stop token, so
   nothing after the stop is reported.
+- **Padded keys are masked out.** The pad tokens a short prompt is padded with
+  sit in the KV cache like any other position. Without a key-padding mask, a
+  short request in a wide batch attends to filler as though it were context, so
+  batched output silently diverges from single-stream output for exactly the
+  requests that were padded. `test_ragged_batch_matches_single_stream` pins it.
+
+Requires `impl` of `sdpa` or `manual`: the tiled `flash` kernel derives its mask
+from positions per tile and rejects a per-batch padding mask rather than
+silently ignoring it.
 """
 
 from __future__ import annotations
@@ -94,12 +103,8 @@ def generate_batch(
 
     Returns one list of new ids per prompt, truncated at ``stop_id`` where hit.
 
-    Note the honest limitation: left-padded rows carry `pad_id` in their KV
-    cache, and this model has no attention mask on the padded positions, so a
-    short prompt in a wide batch attends to a few pad tokens. Greedy output for
-    equal-length prompts is therefore identical to single-stream decoding, but
-    ragged batches are approximate. Masking padded keys is the fix and is not
-    implemented — recorded rather than hidden.
+    Padded positions are masked out of attention, so a ragged batch produces the
+    same tokens as decoding each prompt on its own.
     """
     if not prompts:
         return []
@@ -108,12 +113,12 @@ def generate_batch(
     model.eval()
     try:
         device = next(model.parameters()).device
-        ids, _ = left_pad(prompts, pad_id)
-        ids = ids.to(device)
+        ids, valid = left_pad(prompts, pad_id)
+        ids, valid = ids.to(device), valid.to(device)
         batch = ids.shape[0]
 
         cache = model.new_cache()
-        logits = model(ids, kv_cache=cache, use_cache=True)
+        logits = model(ids, kv_cache=cache, use_cache=True, key_padding_mask=valid)
 
         produced: list[list[int]] = [[] for _ in range(batch)]
         finished = torch.zeros(batch, dtype=torch.bool, device=device)
@@ -138,7 +143,11 @@ def generate_batch(
 
             if len(cache[0]) + 1 > model.max_seq_len:
                 break
-            logits = model(nxt.view(batch, 1), kv_cache=cache, use_cache=True)
+            # Every generated token is real, so the mask grows by a True column.
+            valid = torch.cat([valid, torch.ones(batch, 1, dtype=torch.bool, device=device)], dim=1)
+            logits = model(
+                nxt.view(batch, 1), kv_cache=cache, use_cache=True, key_padding_mask=valid
+            )
 
         return produced
     finally:

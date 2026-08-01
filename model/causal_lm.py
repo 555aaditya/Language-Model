@@ -146,6 +146,7 @@ class CausalLM(nn.Module):
         *,
         kv_cache: list[KVCache] | None = None,
         use_cache: bool = False,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if use_cache and kv_cache is None:
             raise ValueError(
@@ -170,7 +171,12 @@ class CausalLM(nn.Module):
             # runs and still generates plausible text, so it is worth being
             # explicit that the indexing is per-layer.
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = block(x, kv_cache=layer_cache, use_cache=use_cache)
+            x, new_cache = block(
+                x,
+                kv_cache=layer_cache,
+                use_cache=use_cache,
+                key_padding_mask=key_padding_mask,
+            )
             if use_cache and kv_cache is not None and new_cache is not None:
                 kv_cache[i] = new_cache
 

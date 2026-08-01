@@ -98,7 +98,14 @@ class CausalAttention(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         use_cache: bool = False,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | None]:
+        """``key_padding_mask`` is ``[batch, k_len]``, True where a key is real.
+
+        Needed for batched generation over ragged prompts: short prompts are
+        left-padded, and without masking those pad positions every short request
+        attends to filler as though it were context.
+        """
         batch, q_len, _ = x.shape
         offset = len(kv_cache) if kv_cache is not None else 0
 
@@ -135,23 +142,39 @@ class CausalAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
-        out = self._attend(q, k, v, offset=offset)
+        out = self._attend(q, k, v, offset=offset, key_padding_mask=key_padding_mask)
 
         out = out.transpose(1, 2).reshape(batch, q_len, self.n_heads * self.head_dim)
         out = self.resid_dropout(self.o_proj(out))
         return out, (kv_cache if use_cache else None)
 
     def _attend(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, offset: int
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        offset: int,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q_len, k_len = q.shape[2], k.shape[2]
 
-        # A single query attends over the whole cache: nothing to mask.
-        no_mask_needed = q_len == 1
+        # A single query attends over the whole cache: nothing to mask -- unless
+        # some of that cache is padding.
+        no_mask_needed = q_len == 1 and key_padding_mask is None
         # Square case only: torch's implicit triangle is top-left aligned.
-        plain_causal = q_len == k_len
+        plain_causal = q_len == k_len and key_padding_mask is None
 
         if self.impl == "flash":
+            if key_padding_mask is not None:
+                # The tiled kernel builds its mask per tile from positions alone.
+                # Threading a per-batch padding mask through it is real work, and
+                # a silent fallback to another kernel would hide which code path
+                # actually ran -- so refuse explicitly.
+                raise ValueError(
+                    "impl='flash' does not support key_padding_mask; use 'sdpa' or "
+                    "'manual' for batched generation over ragged prompts"
+                )
             return flash_attention(
                 q,
                 k,
@@ -168,6 +191,17 @@ class CausalAttention(nn.Module):
             mask = None  # handled by is_causal below, which skips materialising it
         else:
             mask = causal_block_mask(q_len, k_len, offset, q.device)
+
+        if key_padding_mask is not None:
+            if key_padding_mask.shape != (q.shape[0], k_len):
+                raise ValueError(
+                    f"key_padding_mask must be [batch, k_len] = "
+                    f"{(q.shape[0], k_len)}, got {tuple(key_padding_mask.shape)}"
+                )
+            # Broadcast [B, k_len] -> [B, 1, 1, k_len] and union with the causal
+            # triangle. A key is blocked if it is in the future OR is padding.
+            padded = ~key_padding_mask[:, None, None, :]
+            mask = padded if mask is None else (mask | padded)
 
         if self.impl == "sdpa":
             return sdpa_attention(
