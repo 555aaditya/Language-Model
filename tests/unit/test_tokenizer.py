@@ -141,11 +141,16 @@ def test_save_and_load_round_trip(trained_tokenizer, tmp_path):
     assert loaded.decode(loaded.encode(sample)) == sample
 
 
-def test_load_creates_file(trained_tokenizer):
-    path = "/tmp/bpe_test_vocab.json"
-    trained_tokenizer.save(path)
-    assert os.path.exists(path)
-    os.remove(path)
+def test_save_creates_file(trained_tokenizer, tmp_path):
+    path = tmp_path / "vocab.json"
+    trained_tokenizer.save(str(path))
+    assert path.exists()
+
+
+def test_save_is_silent(trained_tokenizer, tmp_path, capsys):
+    """A tokenizer saved every checkpoint must not narrate into the training log."""
+    trained_tokenizer.save(str(tmp_path / "vocab.json"))
+    assert capsys.readouterr().out == ""
 
 
 # ---------------------------------------------------------------------------
