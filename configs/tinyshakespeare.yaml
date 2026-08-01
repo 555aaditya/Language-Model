@@ -1,0 +1,55 @@
+# A ready-to-run config over the TinyShakespeare corpus (public domain).
+#
+# Prepare the corpus once, then train:
+#
+#   python -m dataset.prepare_corpus --corpus tinyshakespeare --vocab-size 8192
+#   python -m training.train --config configs/tinyshakespeare.yaml
+#
+# Sized to finish in minutes rather than hours, so it is a real end-to-end run
+# you can watch. It is still far past Chinchilla-optimal for the corpus
+# (310k tokens against the ~250M a 20M-parameter model wants), so expect the
+# validation curve to turn upward well before the training curve does — that
+# divergence is the point of having a held-out split, not a failure.
+
+seed: 42
+device: auto            # auto | mps | cuda | cpu
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  n_kv_heads: 2
+  d_ff: 1024
+  vocab_size: 8192      # must match the trained tokenizer
+  max_seq_len: 256
+  rope_theta: 10000.0
+  dropout: 0.1          # a corpus this small needs the regularisation
+  tie_weights: true
+
+attention:
+  impl: sdpa
+  kv_cache: true
+
+dataset:
+  source: file
+  path: data/tinyshakespeare/train.bin
+  val_path: data/tinyshakespeare/val.bin
+  seq_len: 256
+  batch_size: 24
+  num_workers: 0
+
+training:
+  steps: 2000
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  warmup_steps: 100
+  weight_decay: 0.1
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: bfloat16
+  grad_accum_steps: 1
+  log_every: 100
+  eval_every: 250
+  eval_batches: 20
+  ckpt_every: 1000
+  out_dir: checkpoints/tinyshakespeare
