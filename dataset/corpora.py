@@ -148,7 +148,7 @@ def prepare_documents(
     val_fraction: float = 0.05,
     seed: int = 0,
     eot_token: str | None = "<|endoftext|>",
-    out_dir: Path | None = None,
+    out_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Split → encode → write ``train.bin`` / ``val.bin`` from documents in memory.
 
@@ -166,7 +166,8 @@ def prepare_documents(
 
     train_docs, val_docs = split_documents(documents, val_fraction=val_fraction, seed=seed)
 
-    destination = out_dir or (DATA_DIR / name)
+    # Coerce: the natural call passes a str, and `str / str` is a TypeError.
+    destination = Path(out_dir) if out_dir is not None else DATA_DIR / name
     train_bin = destination / "train.bin"
     val_bin = destination / "val.bin"
     n_train = encode_texts_to_bin(tokenizer, train_docs, train_bin, eot_token=eot_token)
@@ -192,7 +193,7 @@ def prepare(
     val_fraction: float = 0.05,
     seed: int = 0,
     eot_token: str | None = "<|endoftext|>",
-    out_dir: Path | None = None,
+    out_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Download → split by document → encode → write ``train.bin`` / ``val.bin``."""
     entry = CORPORA[corpus] if isinstance(corpus, str) else corpus

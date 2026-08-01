@@ -273,6 +273,37 @@ def test_engine_moves_batch_to_device(corpus_bin):
     assert batch["input_ids"].device.type == "cpu"
 
 
+def test_a_split_too_small_for_one_batch_fails_clearly(corpus_bin):
+    """drop_last turns "fewer windows than batch_size" into *zero* batches.
+
+    Without a guard this surfaces as a bare StopIteration from inside torch's
+    sampler, which says nothing about the cause. Most often hit by a small
+    validation split.
+    """
+    eng = DataEngine.from_config(
+        {"dataset": {"source": "file", "path": str(corpus_bin), "seq_len": 10, "batch_size": 99}},
+        vocab_size=100,
+    )
+    with pytest.raises(RuntimeError, match="no batches"):
+        eng.next_batch()
+
+
+def test_drop_last_false_allows_a_short_final_batch(corpus_bin):
+    eng = DataEngine.from_config(
+        {
+            "dataset": {
+                "source": "file",
+                "path": str(corpus_bin),
+                "seq_len": 10,
+                "batch_size": 99,
+                "drop_last": False,
+            }
+        },
+        vocab_size=100,
+    )
+    assert eng.next_batch()["input_ids"].shape[0] == 9  # all available windows
+
+
 def test_engine_rejects_unknown_source():
     with pytest.raises(ValueError, match="source"):
         DataEngine.from_config({"dataset": {"source": "nope", "seq_len": 8}}, vocab_size=50)

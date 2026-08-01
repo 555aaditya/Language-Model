@@ -123,7 +123,20 @@ class DataEngine:
             batch = next(self._iter)
         except StopIteration:
             self._iter = iter(self._loader)
-            batch = next(self._iter)
+            try:
+                batch = next(self._iter)
+            except StopIteration as exc:
+                # An empty loader means the dataset cannot fill even one batch,
+                # which `drop_last=True` turns into zero batches rather than a
+                # short one. Raised here with the arithmetic spelled out, because
+                # the bare StopIteration surfaces from inside torch's sampler and
+                # says nothing about why. Hit most often by a small val split.
+                windows = len(self.dataset) if hasattr(self.dataset, "__len__") else "unknown"
+                raise RuntimeError(
+                    f"dataset yielded no batches: {windows} windows available but "
+                    f"batch_size={self.batch_size} with drop_last={self.drop_last}. "
+                    f"Lower batch_size or seq_len, or set drop_last=False."
+                ) from exc
         if device is None:
             return batch
         # non_blocking pairs with pinned memory to overlap H2D with compute; it
