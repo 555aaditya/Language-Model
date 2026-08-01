@@ -1,11 +1,11 @@
 <div align='center'>
 <h1 align='center'> Language Model Engine 🧠⚡ </h1>
-<p align='center'> A decoder-only GPT-style language model built entirely from scratch in PyTorch — custom byte-level BPE tokenizer, memory-mapped data engine, and grouped-query causal attention with RoPE and a hand-written tiled attention kernel. No pretrained weights, no HuggingFace. </p>
+<p align='center'> A decoder-only GPT-style language model built entirely from scratch in PyTorch — custom byte-level BPE tokenizer, memory-mapped data engine, grouped-query attention with RoPE, a hand-written tiled attention kernel, a hand-written AdamW, and cached autoregressive generation. No pretrained weights, no HuggingFace. </p>
 <div>
 <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white">
 <img src="https://img.shields.io/badge/Apple_Silicon-MPS-000000?logo=apple&logoColor=white">
-<img src="https://img.shields.io/badge/tests-107_passing-4CAF50?logo=pytest&logoColor=white">
+<img src="https://img.shields.io/badge/tests-204_passing-4CAF50?logo=pytest&logoColor=white">
 <img src="https://img.shields.io/badge/ruff-linted-D7FF64?logo=ruff&logoColor=black">
 <img src="https://img.shields.io/badge/mypy-typed-2A6DB2?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/License-MIT-FF6F00">
@@ -22,7 +22,7 @@
 - **Three interchangeable attention kernels:** a readable `manual` reference, torch's fused `sdpa`, and our own `flash` tiled implementation. All three are asserted to produce identical output, so the reference acts as a correctness oracle for the optimised paths.
 - **Memory-mapped data engine:** the corpus is a bare `uint16` array on disk read through `mmap`, so window count comes from `stat()` alone and no bulk copy ever enters RAM — even with multiprocessing workers.
 - **GQA that actually saves memory:** 8 query heads share 2 KV heads, shrinking the KV cache **4×** (2048 KiB → 512 KiB per layer at 512 tokens) and the attention parameters by 37.5%.
-- **Test-driven throughout:** every module's exit test is written before its implementation. **107 tests** currently pass across unit and integration suites.
+- **Test-driven throughout:** every module's exit test is written before its implementation. **204 tests** currently pass across unit and integration suites.
 - **Runs on Apple Silicon:** device resolution is `mps → cuda → cpu`, with bf16 autocast on MPS and no `GradScaler` (which is CUDA-only).
 
 ---
@@ -33,20 +33,20 @@
 flowchart TB
     RAW["📄 Raw text corpus"]
 
-    subgraph FOUNDATION ["Foundation — implemented"]
+    subgraph BUILT ["Implemented — 204 tests"]
         TOK["<b>tokenizer/</b><br/>byte-level BPE<br/>train · encode · decode"]
         DS["<b>dataset/</b><br/>mmap + streaming<br/>windowing · sharding"]
         ATT["<b>attention/</b><br/>GQA + RoPE + KV cache<br/>manual · sdpa · flash"]
-    end
-
-    subgraph PENDING ["Model & Training — planned"]
         MODEL["<b>model/</b><br/>RMSNorm · SwiGLU<br/>CausalLM"]
-        TRAIN["<b>training/</b><br/>AdamW · cosine · AMP"]
-        INFER["<b>inference/</b><br/>sampling · generation"]
-        OPT["<b>optimization/</b><br/>int8 / fp16 quant"]
+        TRAIN["<b>training/</b><br/>AdamW · cosine · AMP<br/>grad accum · checkpoints"]
+        INFER["<b>inference/</b><br/>greedy · top-k · top-p<br/>cached generation"]
     end
 
-    BENCH["<b>benchmark/</b><br/>latency · throughput · memory"]
+    subgraph PENDING ["Planned"]
+        OPT["<b>optimization/</b><br/>int8 / fp16 quant"]
+        BENCH["<b>benchmark/</b><br/>latency · throughput · memory"]
+    end
+
     CKPT[("💾 checkpoints/")]
 
     RAW --> TOK --> DS --> TRAIN
@@ -61,8 +61,8 @@ flowchart TB
     classDef done fill:#1b5e20,stroke:#4CAF50,stroke-width:2px,color:#fff
     classDef todo fill:#37474f,stroke:#78909c,stroke-width:1px,color:#cfd8dc,stroke-dasharray: 4 4
     classDef store fill:#4a148c,stroke:#ab47bc,color:#fff
-    class TOK,DS,ATT done
-    class MODEL,TRAIN,INFER,OPT,BENCH todo
+    class TOK,DS,ATT,MODEL,TRAIN,INFER done
+    class OPT,BENCH todo
     class CKPT,RAW store
 ```
 
@@ -71,9 +71,9 @@ flowchart TB
 | `tokenizer/` | Byte-level BPE with GPT-2 style rendered-unicode keys, special tokens, JSON serialisation | ✅ 14 tests |
 | `dataset/` | `uint16` corpus format, memory-mapped and streaming readers, worker sharding, `DataEngine` | ✅ 29 tests |
 | `attention/` | RoPE, grouped-query causal attention, KV cache, three interchangeable kernels | ✅ 39 tests |
-| `training/` | Config loading, dotted-key CLI overrides, device resolution *(loop pending)* | ◐ 20 tests |
-| `model/` | Transformer blocks: RMSNorm → attention → SwiGLU → `CausalLM` head | ⬜ planned |
-| `inference/` | Greedy / top-k / top-p sampling, cached autoregressive generation | ⬜ planned |
+| `model/` | RMSNorm, SwiGLU, pre-norm blocks, `CausalLM` with weight tying and depth-scaled init | ✅ 25 tests |
+| `training/` | Hand-written AdamW, cosine schedule, AMP, grad accumulation, checkpointing | ✅ 58 tests |
+| `inference/` | Greedy / top-k / top-p sampling, cached autoregressive generation | ✅ 29 tests |
 | `optimization/` | int8 / fp16 post-training quantization, memory pooling | ⬜ planned |
 | `benchmark/` | Latency, throughput, memory and perplexity harness | ⬜ planned |
 
@@ -271,7 +271,7 @@ pytest
 
 *Expected output:*
 ```
-107 passed
+204 passed
 ```
 
 #### Run the entry point
@@ -297,7 +297,7 @@ python -m training.train --config configs/default.yaml training.lr=3e-4 model.n_
 ### Testing
 
 ```bash
-pytest                                    # everything (107 tests)
+pytest                                    # everything (204 tests)
 pytest tests/unit -q                      # unit only
 pytest tests/integration -q               # cross-module seams
 pytest tests/unit/test_attention.py -q    # one module
@@ -317,8 +317,37 @@ pytest --cov=tokenizer --cov=dataset --cov=attention --cov-report=term-missing
 | `test_tokenizer.py` | 14 | Encode/decode round trips, unicode, merge ordering, special tokens, serialisation |
 | `test_dataset.py` | 29 | `uint16` bounds, window arithmetic, next-token shift, worker sharding, DataLoader trap avoidance |
 | `test_attention.py` | 39 | Causal masking, RoPE relative-distance property, GQA group mapping, KV-cache equivalence, kernel agreement |
+| `test_model.py` | 25 | RMSNorm vs LayerNorm behaviour, SwiGLU gating, pre-norm residuals, parameter count, weight tying, cached decode |
+| `test_optimizer.py` | 20 | AdamW matching `torch.optim.AdamW` step for step, decoupled decay, no-decay groups, cosine schedule shape |
+| `test_trainer.py` | 18 | Overfit-one-batch, grad accumulation equivalence, clipping, LR schedule, checkpoint resume |
 | `test_train_config.py` | 20 | YAML loading, dotted-key overrides, type preservation across overrides |
+| `test_inference.py` | 29 | Greedy determinism, top-k/top-p set selection, cross-device seeded sampling, cached-vs-uncached generation |
 | `test_tokenizer_dataset_attention.py` | 5 | Cross-module seams: tokenizer → `.bin` → batches → attention |
+| `test_end_to_end.py` | 5 | Full pipeline learns real text; trained model's cache stays equivalent; resume converges |
+
+---
+
+### A Measured Run
+
+Training this repo's own `docs/TDD.md` as a corpus, on an M5 Pro via MPS:
+
+| | |
+|---|---|
+| Corpus | 39,922 chars → **10,677 tokens** (3.74 chars/token) |
+| Tokenizer | 2,048 vocab, 1,791 merges, trained in 4.0 s |
+| Model | 4.33M params — `d_model` 256, 4 layers, 8 heads / 2 KV heads |
+| Throughput | **~75,000 tokens/sec** (bf16 autocast) |
+| 250 steps | 6.9 s wall clock |
+| Loss | 7.679 → 0.017 (baseline `ln(2048)` = 7.625) |
+
+**Read that loss honestly:** 4.33M parameters against 10,677 tokens is a ~400:1
+overparameterisation, so 0.017 is memorisation, not language modelling. The
+generations show it — correct markdown structure, real vocabulary from the
+document, no coherent syntax. What the run demonstrates is that the *pipeline*
+is sound end to end: the tokenizer round-trips, the corpus packs, gradients
+flow, the schedule fires, and the cache generates. Producing a model worth
+evaluating needs a corpus several orders of magnitude larger, which is what the
+`benchmark/` stage exists to measure.
 
 ---
 
@@ -372,9 +401,9 @@ flowchart LR
     classDef done fill:#1b5e20,stroke:#4CAF50,stroke-width:2px,color:#fff
     classDef next fill:#e65100,stroke:#ffb74d,stroke-width:2px,color:#fff
     classDef todo fill:#37474f,stroke:#78909c,color:#cfd8dc,stroke-dasharray: 4 4
-    class S0,S1,S2 done
-    class S3 next
-    class S4,S5,S6,S7 todo
+    class S0,S1,S2,S3,S4,S5 done
+    class S6 next
+    class S7 todo
 ```
 
 Each stage has an exit test written *before* the implementation. See [`docs/BUILD_ORDER.md`](docs/BUILD_ORDER.md) for the stable interface contracts.
@@ -388,7 +417,7 @@ Each stage has an exit test written *before* the implementation. See [`docs/BUIL
 | **PyTorch 2.13** | Autograd, tensor math, and device management — every layer above that is hand-written |
 | **NumPy** | `memmap` corpus reader and the `uint16` on-disk token format |
 | **Apple MPS** | Primary development accelerator; bf16 autocast, fused `scaled_dot_product_attention` |
-| **pytest** | 107-test TDD suite — exit tests written before each module |
+| **pytest** | 204-test TDD suite — exit tests written before each module |
 | **ruff** | Linting and formatting, 100-char lines, `E/F/I/W/UP/B` rule set |
 | **mypy** | Static type checking across all eight packages |
 | **PyYAML** | Config format, reused as the CLI override parser so types can never diverge |
@@ -431,11 +460,21 @@ Language-Model/
 │   ├── kv_cache.py       # per-layer K/V cache
 │   ├── kernels.py        # manual · sdpa · flash
 │   └── causal.py         # CausalAttention (GQA)
-├── training/         # entry point + device    ◐
-│   ├── train.py          # config, overrides, CLI
-│   └── device.py         # mps → cuda → cpu resolution
-├── model/            # transformer blocks      ⬜
-├── inference/        # sampling / generation   ⬜
+├── model/            # transformer             ✅
+│   ├── norm.py           # RMSNorm
+│   ├── ffn.py            # SwiGLU
+│   ├── block.py          # pre-norm TransformerBlock
+│   └── causal_lm.py      # CausalLM
+├── training/         # training engine         ✅
+│   ├── optimizer.py      # hand-written AdamW + param groups
+│   ├── scheduler.py      # cosine decay w/ linear warmup
+│   ├── trainer.py        # AMP, grad accum, clipping
+│   ├── checkpoint.py     # save / resume
+│   ├── device.py         # mps → cuda → cpu resolution
+│   └── train.py          # config, overrides, CLI
+├── inference/        # generation              ✅
+│   ├── sampling.py       # temperature · top-k · top-p
+│   └── generate.py       # cached autoregressive loop
 ├── optimization/     # quantization            ⬜
 ├── benchmark/        # metrics harness         ⬜
 ├── configs/          # default.yaml

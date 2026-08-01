@@ -27,16 +27,16 @@ tokenizer ──► dataset ──► training ──► checkpoints ──► i
 
 | # | Module | Depends on | Deliverable | Exit test |
 |---|--------|-----------|-------------|-----------|
-| 0 | **tokenizer** ✅ | — | `BPE` with train/encode/decode/save/load | 14/14 unit tests |
-| 1 | **dataset** | tokenizer | streaming dataset → `(input_ids, labels)` batches | shapes/dtype/shift-correctness test |
-| 2 | **attention** | config | causal GQA + RoPE + KV cache | causal-mask & KV-cache equivalence test |
-| 3 | **model** | attention | `CausalLM` (embed → blocks → RMSNorm → LM head) | forward shape + param-count test |
-| 4 | **training** | dataset + model | AdamW + cosine + AMP loop in `training/train.py` | overfit-one-batch loss↓ test |
-| 5 | **inference** | model ckpt | greedy / top-k / top-p sampling | deterministic greedy test |
+| 0 | **tokenizer** ✅ | — | `BPE` with train/encode/decode/save/load | 14 unit tests |
+| 1 | **dataset** ✅ | tokenizer | mmap + streaming datasets → dict batches | 29 unit tests |
+| 2 | **attention** ✅ | config | causal GQA + RoPE + KV cache, 3 kernels | 39 unit tests |
+| 3 | **model** ✅ | attention | `CausalLM` (embed → blocks → RMSNorm → LM head) | 25 unit tests |
+| 4 | **training** ✅ | dataset + model | AdamW + cosine + AMP loop | 58 unit tests (incl. overfit-one-batch) |
+| 5 | **inference** ✅ | model ckpt | greedy / top-k / top-p sampling | 29 unit tests |
 | 6 | **optimization** | model ckpt | int8/int4 quant + optional kernels | perplexity-within-tolerance test |
 | 7 | **benchmark** | all | latency / throughput / memory / perplexity harness | reproduces a recorded baseline |
 
-> Build 1 and 2 in parallel. Keep 6 optional/feature-flagged so it never blocks 5.
+> Stages 0–5 are implemented (204 tests). Keep 6 optional/feature-flagged so it never blocks 5.
 
 ## Contracts (stable interfaces — change only via ADR)
 
@@ -56,8 +56,15 @@ class CausalAttention(nn.Module):
 # model
 class CausalLM(nn.Module):
     def forward(self, input_ids, *, kv_cache=None, use_cache=False): ...  # -> logits [B, T, V]
+    def new_cache(self) -> list[KVCache]: ...  # one entry per layer
     @classmethod
     def from_config(cls, cfg: dict) -> "CausalLM": ...
+
+# forward returns logits only -- cross-entropy lives in the trainer, so the
+# model stays pure for inference. Because of that there is nowhere to return a
+# freshly built cache, so the cache is CALLER-OWNED: allocate once with
+# new_cache() and pass the same list every step; entries mutate in place.
+# use_cache=True without a cache raises rather than silently discarding it.
 
 
 # inference
