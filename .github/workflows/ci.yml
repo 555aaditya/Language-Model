@@ -2,8 +2,12 @@ name: CI
 
 
 on:
+  # PRs into main are the merge gate (TDR-014). Pushes to any branch also run,
+  # so breakage on Linux or an older Python is found while the work is in
+  # progress rather than at PR time -- this workflow sat unexecuted for its
+  # whole life because nothing had been pushed to main or opened as a PR.
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
     branches: [main]
 
@@ -44,7 +48,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - name: Install package + type stubs
-        run: pip install -e .[dev]
+        run: pip install -e ".[dev]"
       - name: mypy
         run: mypy tokenizer dataset model attention training inference optimization benchmark
 
@@ -63,7 +67,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install package
-        run: pip install -e .[dev]
+        run: pip install -e ".[dev]"
       - name: Run tests with coverage
         run: pytest --cov=tokenizer --cov=dataset --cov=model --cov=attention --cov=training --cov=inference --cov=optimization --cov=benchmark --cov-report=term-missing
 
@@ -95,4 +99,12 @@ jobs:
           print('dataset + attention smoke OK')
           "
       - name: Training entry point runs
-        run: python -m training.train --config configs/default.yaml dataset.batch_size=2 dataset.seq_len=32
+        # Bounded deliberately. This step is a wiring check, not a training run:
+        # the shipped config is 2000 steps of a 32.5M model, which on a CPU
+        # runner is ~1.8 minutes and writes ~1.8 GB of checkpoints.
+        run: |
+          python -m training.train --config configs/default.yaml \
+            dataset.batch_size=2 dataset.seq_len=32 \
+            training.steps=5 training.warmup_steps=1 \
+            training.ckpt_every=0 training.log_every=1 \
+            training.out_dir="${RUNNER_TEMP:-/tmp}/ci-checkpoints"
