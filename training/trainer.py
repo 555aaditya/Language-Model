@@ -21,6 +21,7 @@ no scaler at all, so on those paths autocast runs bare.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -165,6 +166,32 @@ class Trainer:
             if on_log and self.step_count % max(1, self.log_every) == 0:
                 on_log(metrics)
         return history
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def evaluate(self, engine: BatchSource, *, batches: int = 20) -> dict[str, float]:
+        """Mean loss and perplexity over ``batches`` from a held-out source.
+
+        Averages the *loss* and exponentiates once at the end. Averaging
+        perplexities instead would be wrong — perplexity is exp of a mean, and
+        the mean of exponentials is not the exponential of the mean (Jensen), so
+        per-batch averaging reports a number that is always too high.
+
+        Restores the previous train/eval mode so this can be called mid-loop
+        without silently leaving dropout off for the rest of training.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            total = 0.0
+            for _ in range(batches):
+                total += self.loss_on(engine.next_batch(self.device)).item()
+            mean = total / max(1, batches)
+            return {"val_loss": mean, "val_perplexity": math.exp(min(mean, 80.0))}
+        finally:
+            self.model.train(was_training)
 
     # ------------------------------------------------------------------
     # Checkpointing
