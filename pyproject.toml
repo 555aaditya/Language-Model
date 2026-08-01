@@ -8,7 +8,11 @@ version = "0.1.0"
 description = "Production-grade decoder-only language model built from scratch in PyTorch"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+# Floor is 3.12, not 3.10: numpy >=2.3 ships PEP 695 `type` statements in its
+# stubs, which mypy refuses to parse when analysing for an older target. Rather
+# than typecheck against a Python we never run, the whole toolchain is pinned to
+# one floor -- runtime, ruff target, mypy target, and the CI matrix all agree.
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.1",
     "numpy>=1.24",
@@ -27,9 +31,10 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 100
 src = ["."]
+extend-exclude = [".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
@@ -37,7 +42,7 @@ select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E741"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
