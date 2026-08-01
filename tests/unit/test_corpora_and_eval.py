@@ -128,6 +128,20 @@ def test_read_documents_drops_blanks(tmp_path):
     assert read_documents(path) == ["one", "two", "three"]
 
 
+def test_out_dir_accepts_a_plain_string():
+    """The natural call passes a str; `str / "train.bin"` is a TypeError."""
+    import tempfile
+
+    from dataset import prepare_documents
+    from tokenizer import BPE
+
+    tok = BPE(vocab_size=300)
+    tok.train(DOCS)
+    with tempfile.TemporaryDirectory() as tmp:
+        info = prepare_documents(DOCS, tok, out_dir=tmp)  # str, not Path
+        assert info["train_tokens"] > 0
+
+
 def test_every_corpus_declares_a_licence():
     """ "Where did the training data come from" is unpleasant to answer late."""
     for name, corpus in CORPORA.items():
