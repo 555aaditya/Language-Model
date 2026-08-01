@@ -1,7 +1,5 @@
 name: CI
 
-# Free-tier GitHub Actions CI (TDR-014). Runs on every PR and every push to main.
-# All jobs must pass before a PR can be merged (enforce via branch protection).
 
 on:
   push:
@@ -17,6 +15,7 @@ permissions:
   contents: read
 
 env:
+  # Floor is 3.12 (see the comment on requires-python in pyproject.toml).
   PYTHON_VERSION: "3.12"
 
 jobs:
@@ -55,7 +54,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # 3.14 is the version this project is developed on; 3.12 is the floor.
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -82,3 +82,17 @@ jobs:
         run: |
           python -c "import tokenizer, dataset, model, attention, training, inference, optimization, benchmark; print('all modules import OK')"
           python -c "from tokenizer import BPE; t=BPE(vocab_size=256); ids=t.encode('hello'); assert t.decode(ids)=='hello'; print('tokenizer smoke OK')"
+          python -c "
+          import torch
+          from attention import CausalAttention
+          from dataset import DataEngine
+          e = DataEngine.from_config({'dataset': {'source': 'synthetic', 'seq_len': 16, 'batch_size': 2}}, vocab_size=64)
+          b = e.next_batch()
+          assert b['input_ids'].shape == (2, 16)
+          a = CausalAttention(d_model=32, n_heads=4, n_kv_heads=2, max_seq_len=64).eval()
+          out, cache = a(torch.randn(2, 16, 32), use_cache=True)
+          assert out.shape == (2, 16, 32) and len(cache) == 16
+          print('dataset + attention smoke OK')
+          "
+      - name: Training entry point runs
+        run: python -m training.train --config configs/default.yaml dataset.batch_size=2 dataset.seq_len=32
