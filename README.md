@@ -69,7 +69,7 @@ flowchart TB
 | `attention/` | RoPE, grouped-query causal attention, KV cache, three kernels + recomputing backward | ✅ 43 tests |
 | `model/` | RMSNorm, SwiGLU, pre-norm blocks, `CausalLM` with weight tying and depth-scaled init | ✅ 25 tests |
 | `training/` | Hand-written AdamW, cosine schedule, AMP, grad accumulation, checkpoints, validation | ✅ 58 tests |
-| `inference/` | Greedy / top-k / top-p sampling, cached generation, batched generation | ✅ 29 tests |
+| `inference/` | Greedy / top-k / top-p sampling, cached generation, batched generation with key padding | ✅ 29 tests |
 | `optimization/` | int8 / int4 per-channel weight quantization, preallocated KV arena | ✅ 38 tests |
 | `benchmark/` | Device-synced timing harness, p50/p90/p95/p99, exact memory metrics, baseline report | ✅ 25 tests |
 

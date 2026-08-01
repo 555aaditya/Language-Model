@@ -56,8 +56,14 @@ class TransformerBlock(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         use_cache: bool = False,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | None]:
-        attn_out, new_cache = self.attn(self.attn_norm(x), kv_cache=kv_cache, use_cache=use_cache)
+        attn_out, new_cache = self.attn(
+            self.attn_norm(x),
+            kv_cache=kv_cache,
+            use_cache=use_cache,
+            key_padding_mask=key_padding_mask,
+        )
         x = x + attn_out
         x = x + self.ffn(self.ffn_norm(x))
         return x, new_cache

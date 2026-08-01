@@ -312,6 +312,65 @@ def test_batched_greedy_matches_single_stream_for_equal_lengths():
     assert batched == single
 
 
+def test_ragged_batch_matches_single_stream():
+    """The load-bearing batching test: padded rows must not attend to filler.
+
+    Short prompts are left-padded, and those pad tokens land in the KV cache like
+    any other position. Without a key-padding mask a short request in a wide
+    batch silently produces different tokens than it would alone -- and only for
+    the requests that were padded, which is the hardest version to notice.
+    """
+    torch.manual_seed(0)
+    cfg = make_cfg()
+    cfg["attention"]["impl"] = "sdpa"
+    model = CausalLM.from_config(cfg).eval()
+
+    prompts = [[3, 9, 14, 21, 5], [7], [11, 2]]  # deliberately ragged
+    batched = generate_batch(model, prompts, max_new_tokens=8, temperature=0.0)
+    single = [
+        generate_ids(model, torch.tensor([p]), max_new_tokens=8, temperature=0.0) for p in prompts
+    ]
+    assert batched == single
+
+
+def test_padding_mask_actually_changes_the_result():
+    """Guards against the mask being accepted and then ignored.
+
+    If threading it through were a no-op this test would fail, and
+    test_ragged_batch_matches_single_stream would silently be testing nothing.
+    """
+    torch.manual_seed(0)
+    cfg = make_cfg()
+    cfg["attention"]["impl"] = "sdpa"
+    model = CausalLM.from_config(cfg).eval()
+
+    ids, valid = left_pad([[3, 9, 14, 21, 5], [7]], pad_id=0)
+    masked = model(ids, kv_cache=model.new_cache(), use_cache=True, key_padding_mask=valid)
+    unmasked = model(ids, kv_cache=model.new_cache(), use_cache=True)
+    # Row 0 is unpadded, so it is unaffected; row 1 is padded, so it must move.
+    torch.testing.assert_close(masked[0], unmasked[0], rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(masked[1], unmasked[1])
+
+
+def test_a_wrongly_shaped_padding_mask_is_rejected():
+    cfg = make_cfg()
+    cfg["attention"]["impl"] = "sdpa"
+    model = CausalLM.from_config(cfg).eval()
+    ids = torch.zeros(2, 4, dtype=torch.long)
+    with pytest.raises(ValueError, match=r"\[batch, k_len\]"):
+        model(ids, key_padding_mask=torch.ones(2, 9, dtype=torch.bool))
+
+
+def test_flash_refuses_a_padding_mask_rather_than_ignoring_it():
+    """A silent fallback to another kernel would hide which path ran."""
+    cfg = make_cfg()
+    cfg["attention"]["impl"] = "flash"
+    model = CausalLM.from_config(cfg).eval()
+    ids = torch.zeros(2, 4, dtype=torch.long)
+    with pytest.raises(ValueError, match="flash"):
+        model(ids, key_padding_mask=torch.ones(2, 4, dtype=torch.bool))
+
+
 def test_batched_generation_returns_one_continuation_per_prompt():
     out = generate_batch(make_model(), [[1, 2], [3], [4, 5, 6]], max_new_tokens=5, temperature=0.0)
     assert len(out) == 3
