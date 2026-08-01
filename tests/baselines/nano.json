@@ -1,0 +1,50 @@
+{
+  "attention_scores": {
+    "scales_as": "O(T^2)",
+    "seq_len": 32,
+    "standard_score_bytes": 16384,
+    "standard_score_mib": 0.0156
+  },
+  "config": {
+    "d_ff": 64,
+    "d_model": 32,
+    "dropout": 0.0,
+    "max_seq_len": 32,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "n_layers": 2,
+    "rope_theta": 10000.0,
+    "tie_weights": true,
+    "vocab_size": 64
+  },
+  "gqa_kv_cache": {
+    "gqa_bytes": 8192,
+    "gqa_mib": 0.0078,
+    "mha_bytes": 16384,
+    "mha_mib": 0.0156,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "saving_ratio": 2.0
+  },
+  "model_memory": {
+    "bytes": {
+      "fp16": 43328,
+      "fp32": 86656,
+      "int4": 24192,
+      "int8": 33408
+    },
+    "compression_vs_fp32": {
+      "fp16": 2.0,
+      "fp32": 1.0,
+      "int4": 3.582,
+      "int8": 2.5939
+    },
+    "mib": {
+      "fp16": 0.0413,
+      "fp32": 0.0826,
+      "int4": 0.0231,
+      "int8": 0.0319
+    },
+    "parameters": 20640
+  }
+}
