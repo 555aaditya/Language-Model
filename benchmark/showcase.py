@@ -103,12 +103,38 @@ def show_latency(model: CausalLM) -> None:
     print(f"\n  prefill throughput  {prefill['tokens_per_sec']:>10,.0f} tok/s")
     print(f"  decode  throughput  {decode['tokens_per_sec']:>10,.0f} tok/s")
 
-    speedup = kv_cache_speedup(model, prompt_len=16, max_new_tokens=64, repeats=5)
-    verdict = "cache wins" if speedup["cache_wins"] else "cache LOSES at this size"
-    print(
-        f"\n  KV cache @ 64 new tokens: {speedup['uncached_ms']:.0f} ms -> "
-        f"{speedup['cached_ms']:.0f} ms  ({speedup['speedup']:.2f}x, {verdict})"
-    )
+    # Reported across several lengths, because a single figure hides the point:
+    # the cache removes O(T^2) recompute, so its advantage *grows* with the
+    # generation. Quoting only a short run makes a real asymptotic win look
+    # like noise.
+    print("\n  KV cache — measured, not assumed (TDR-012):")
+    print(f"    {'new tokens':>11}{'uncached':>11}{'cached':>10}{'speedup':>10}")
+    for length in (32, 128, 256):
+        result = kv_cache_speedup(model, prompt_len=16, max_new_tokens=length, repeats=3)
+        print(
+            f"    {length:>11}{result['uncached_ms']:>8.0f} ms{result['cached_ms']:>7.0f} ms"
+            f"{result['speedup']:>9.2f}x"
+        )
+
+
+def measure_perplexity(model: CausalLM, cfg: dict, val_path: str, batches: int) -> float:
+    """Evaluate held-out perplexity here and now, rather than accept a number.
+
+    A figure typed in on the command line is indistinguishable from one that was
+    invented. Measuring it in the same process that prints it means the whole
+    output is generated.
+    """
+    from dataset import DataEngine
+    from training.trainer import Trainer
+
+    eval_cfg = {
+        **cfg,
+        "dataset": {**cfg["dataset"], "source": "file", "path": val_path, "shuffle": False},
+        "training": {**cfg.get("training", {}), "amp": False},
+    }
+    engine = DataEngine.from_config(eval_cfg, vocab_size=int(cfg["model"]["vocab_size"]))
+    trainer = Trainer(model, engine, eval_cfg, device=next(model.parameters()).device)
+    return float(trainer.evaluate(engine, batches=batches)["val_perplexity"])
 
 
 def show_completions(
@@ -118,7 +144,9 @@ def show_completions(
 
     header("AUTOCOMPLETION — greedy-free sampling from the trained checkpoint")
     if val_ppl is not None:
-        print(f"  held-out perplexity {val_ppl:.1f} — read the samples against this\n")
+        print(
+            f"  held-out perplexity {val_ppl:.1f} (measured now) — read the samples against this\n"
+        )
 
     for prompt in prompts:
         text = generate(
@@ -143,7 +171,12 @@ def main() -> None:
     parser.add_argument("--config", default="configs/tinyshakespeare.yaml")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--vocab", default=None)
-    parser.add_argument("--val-perplexity", type=float, default=None)
+    parser.add_argument(
+        "--val-path",
+        default=None,
+        help="held-out .bin; perplexity is measured here rather than passed in",
+    )
+    parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--skip-latency", action="store_true")
     args = parser.parse_args()
 
@@ -169,10 +202,14 @@ def main() -> None:
     if not args.skip_latency:
         show_latency(model)
 
+    val_ppl = None
+    if args.val_path and Path(args.val_path).exists():
+        val_ppl = measure_perplexity(model, cfg, args.val_path, args.eval_batches)
+
     if args.vocab and Path(args.vocab).exists():
         tokenizer = BPE(vocab_size=int(cfg["model"]["vocab_size"]))
         tokenizer.load(args.vocab)
-        show_completions(model, tokenizer, DEFAULT_PROMPTS, args.val_perplexity)
+        show_completions(model, tokenizer, DEFAULT_PROMPTS, val_ppl)
     print(RULE)
 
 
