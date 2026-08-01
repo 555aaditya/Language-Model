@@ -74,6 +74,24 @@ def apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]
     return cfg
 
 
+def build_val_engine(cfg: dict[str, Any]) -> DataEngine | None:
+    """A second engine over ``dataset.val_path``, or None if none is configured.
+
+    Held-out evaluation is opt-in rather than automatic: the synthetic source has
+    no meaningful validation split (it is uniform noise by construction), and
+    silently evaluating against training data would report a number that looks
+    like generalisation and is not.
+    """
+    val_path = cfg.get("dataset", {}).get("val_path")
+    if not val_path:
+        return None
+    val_cfg = {
+        **cfg,
+        "dataset": {**cfg["dataset"], "source": "file", "path": val_path, "shuffle": False},
+    }
+    return DataEngine.from_config(val_cfg, vocab_size=cfg["model"]["vocab_size"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the language model")
     parser.add_argument("--config", default="configs/default.yaml")
@@ -100,15 +118,34 @@ def main() -> None:
     model = CausalLM.from_config(cfg)
     engine = DataEngine.from_config(cfg, vocab_size=cfg["model"]["vocab_size"])
     trainer = Trainer(model, engine, cfg, device=device)
+    val_engine = build_val_engine(cfg)
 
     steps = int(cfg["training"]["steps"])
     log_every = max(1, int(cfg["training"].get("log_every", 50)))
     ckpt_every = int(cfg["training"].get("ckpt_every", 0))
+    eval_every = int(cfg["training"].get("eval_every", 0))
+    eval_batches = int(cfg["training"].get("eval_batches", 20))
 
     print(
         f"device {device} | amp {amp_dtype or 'off (fp32)'} | "
         f"{model.num_parameters() / 1e6:.2f}M params | {steps} steps"
+        + ("" if val_engine else " | no validation split configured")
     )
+
+    last_evaluated = -1
+
+    def report_validation(step: int) -> None:
+        nonlocal last_evaluated
+        # Guard against the final report duplicating an eval_every hit that just
+        # landed on the same step.
+        if val_engine is None or step == last_evaluated:
+            return
+        last_evaluated = step
+        val = trainer.evaluate(val_engine, batches=eval_batches)
+        print(
+            f"step {step:>6}/{steps}  val_loss {val['val_loss']:.4f}  "
+            f"val_ppl {val['val_perplexity']:.2f}"
+        )
 
     for _ in range(steps):
         metrics = trainer.step()
@@ -119,9 +156,12 @@ def main() -> None:
                 f"lr {metrics['lr']:.2e}  grad_norm {metrics['grad_norm']:.3f}  "
                 f"{metrics['tokens_per_sec']:,.0f} tok/s"
             )
+        if eval_every and n % eval_every == 0:
+            report_validation(n)
         if ckpt_every and n % ckpt_every == 0:
             trainer.save(str(out_dir / f"step_{n}.pt"))
 
+    report_validation(trainer.step_count)
     final = out_dir / "final.pt"
     trainer.save(str(final))
     print(f"saved {final}")
