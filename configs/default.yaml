@@ -13,13 +13,15 @@ model:
   max_seq_len: 1024
   rope_theta: 10000.0
   dropout: 0.0
+  tie_weights: true      # reuse the token embedding as the LM head
 
 attention:
   impl: sdpa             # sdpa | flash | manual
   kv_cache: true
 
 dataset:
-  source: synthetic      # synthetic | file | hf
+  source: synthetic      # synthetic | file (mmap) | stream (sequential)
+  path: null             # required for source: file | stream
   seq_len: 512
   batch_size: 16
   num_workers: 0
