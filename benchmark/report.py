@@ -77,16 +77,29 @@ def deterministic_report(cfg: dict[str, Any]) -> dict[str, Any]:
 def measured_report(
     cfg: dict[str, Any], *, prompt_len: int = 32, max_new_tokens: int = 32
 ) -> dict[str, Any]:
-    """Wall-clock metrics. Interpret only alongside ``environment()``."""
+    """Wall-clock metrics. Interpret only alongside ``environment()``.
+
+    Sample counts are set by what each phase costs, not by a single default.
+    A percentile resolves tail probabilities no finer than ``1/runs``, so the
+    5-repeat default would report a p99 that is just the maximum under another
+    name. Prefill is ~3 ms, so 100 runs is nearly free; decode is ~80 ms, so 20
+    runs is the affordable compromise — and ``resolvable_percentile`` in the
+    output states the ceiling either way.
+    """
     torch.manual_seed(0)
     model = CausalLM.from_config(cfg).eval().to(resolve_device(cfg.get("device")))
     return {
-        "prefill": benchmark_prefill(model, prompt_len=prompt_len, repeats=5),
+        "prefill": benchmark_prefill(model, prompt_len=prompt_len, warmup=5, repeats=100),
         "decode_cached": benchmark_decode(
-            model, prompt_len=prompt_len, max_new_tokens=max_new_tokens, use_cache=True
+            model,
+            prompt_len=prompt_len,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+            warmup=2,
+            repeats=20,
         ),
         "kv_cache_speedup": kv_cache_speedup(
-            model, prompt_len=prompt_len, max_new_tokens=max_new_tokens
+            model, prompt_len=prompt_len, max_new_tokens=max_new_tokens, repeats=10
         ),
     }
 
