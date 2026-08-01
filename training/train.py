@@ -13,13 +13,16 @@ and docs/BUILD_ORDER.md for the dependency-aware plan).
 import argparse
 import os
 import random
+from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
 
 from dataset import DataEngine
+from model import CausalLM
 from training.device import autocast_dtype, resolve_device
+from training.trainer import Trainer
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -74,6 +77,7 @@ def apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the language model")
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("-v", "--verbose", action="store_true", help="echo the full config")
     parser.add_argument("overrides", nargs="*", help="dotted.key=value overrides")
     args = parser.parse_args()
 
@@ -86,30 +90,41 @@ def main() -> None:
     device = resolve_device(cfg.get("device"))
     amp_dtype = autocast_dtype(device, cfg["training"].get("amp_dtype", "bfloat16"))
 
-    os.makedirs(cfg["training"]["out_dir"], exist_ok=True)
+    out_dir = Path(cfg["training"]["out_dir"])
+    os.makedirs(out_dir, exist_ok=True)
 
-    print("Loaded config from", args.config)
-    print(yaml.safe_dump(cfg, sort_keys=False))
-    print(f"device: {device} | amp dtype: {amp_dtype or 'disabled (fp32)'}")
+    if args.verbose:
+        print("Loaded config from", args.config)
+        print(yaml.safe_dump(cfg, sort_keys=False))
 
-    # Stages 0-2 are implemented; the loop below stays a stub until the model
-    # exists, because a "training" run with no model would be theatre.
+    model = CausalLM.from_config(cfg)
     engine = DataEngine.from_config(cfg, vocab_size=cfg["model"]["vocab_size"])
-    batch = engine.next_batch(device)
-    print(
-        f"dataset engine OK: input_ids {tuple(batch['input_ids'].shape)}, "
-        f"labels {tuple(batch['labels'].shape)} on {batch['input_ids'].device}"
-    )
+    trainer = Trainer(model, engine, cfg, device=device)
+
+    steps = int(cfg["training"]["steps"])
+    log_every = max(1, int(cfg["training"].get("log_every", 50)))
+    ckpt_every = int(cfg["training"].get("ckpt_every", 0))
 
     print(
-        "Implemented: tokenizer, dataset, attention.\n"
-        "Remaining, in dependency order:\n"
-        "  3. model        (RMSNorm + SwiGLU blocks -> CausalLM head)\n"
-        "  4. training     (AdamW, cosine schedule, AMP loop)\n"
-        "  5. inference    (sampling / decoding)\n"
-        "  6. optimization (quantization / kernels)\n"
-        "  7. benchmark    (metrics harness)"
+        f"device {device} | amp {amp_dtype or 'off (fp32)'} | "
+        f"{model.num_parameters() / 1e6:.2f}M params | {steps} steps"
     )
+
+    for _ in range(steps):
+        metrics = trainer.step()
+        n = trainer.step_count
+        if n % log_every == 0 or n == steps:
+            print(
+                f"step {n:>6}/{steps}  loss {metrics['loss']:.4f}  "
+                f"lr {metrics['lr']:.2e}  grad_norm {metrics['grad_norm']:.3f}  "
+                f"{metrics['tokens_per_sec']:,.0f} tok/s"
+            )
+        if ckpt_every and n % ckpt_every == 0:
+            trainer.save(str(out_dir / f"step_{n}.pt"))
+
+    final = out_dir / "final.pt"
+    trainer.save(str(final))
+    print(f"saved {final}")
 
 
 if __name__ == "__main__":
