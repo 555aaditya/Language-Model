@@ -5,7 +5,7 @@
 <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/PyTorch-2.13-EE4C2C?logo=pytorch&logoColor=white">
 <img src="https://img.shields.io/badge/Apple_Silicon-MPS-000000?logo=apple&logoColor=white">
-<img src="https://img.shields.io/badge/tests-359_passing-4CAF50?logo=pytest&logoColor=white">
+<img src="https://img.shields.io/badge/tests-371_passing-4CAF50?logo=pytest&logoColor=white">
 <img src="https://img.shields.io/badge/ruff-linted-D7FF64?logo=ruff&logoColor=black">
 <img src="https://img.shields.io/badge/mypy-typed-2A6DB2?logo=python&logoColor=white">
 <img src="https://img.shields.io/badge/License-MIT-FF6F00">
@@ -22,7 +22,7 @@
 - **Three interchangeable attention kernels:** a readable `manual` reference, torch's fused `sdpa`, and our own `flash` tiled implementation. All three are asserted to produce identical output, so the reference acts as a correctness oracle for the optimised paths.
 - **Memory-mapped data engine:** the corpus is a bare `uint16` array on disk read through `mmap`, so window count comes from `stat()` alone and no bulk copy ever enters RAM — even with multiprocessing workers.
 - **GQA that actually saves memory:** 8 query heads share 2 KV heads, shrinking the KV cache **4×** (2048 KiB → 512 KiB per layer at 512 tokens) and the attention parameters by 37.5%.
-- **Test-driven throughout:** every module's exit test is written before its implementation. **359 tests** currently pass across unit and integration suites.
+- **Test-driven throughout:** every module's exit test is written before its implementation. **371 tests** currently pass across unit and integration suites.
 - **Runs on Apple Silicon:** device resolution is `mps → cuda → cpu`, with bf16 autocast on MPS and no `GradScaler` (which is CUDA-only).
 
 ---
@@ -33,7 +33,7 @@
 flowchart TB
     RAW["📄 Raw text corpus"]
 
-    subgraph BUILT ["Implemented — 359 tests"]
+    subgraph BUILT ["Implemented — 371 tests"]
         TOK["<b>tokenizer/</b><br/>byte-level BPE<br/>train · encode · decode"]
         DS["<b>dataset/</b><br/>mmap + streaming<br/>windowing · sharding"]
         ATT["<b>attention/</b><br/>GQA + RoPE + KV cache<br/>manual · sdpa · flash"]
@@ -322,7 +322,7 @@ pytest
 
 *Expected output:*
 ```
-359 passed
+370 passed, 1 skipped
 ```
 
 #### Run the entry point
@@ -348,7 +348,7 @@ python -m training.train --config configs/default.yaml training.lr=3e-4 model.n_
 ### Testing
 
 ```bash
-pytest                                    # everything (359 tests)
+pytest                                    # everything (371 tests)
 pytest tests/unit -q                      # unit only
 pytest tests/integration -q               # cross-module seams
 pytest tests/unit/test_attention.py -q    # one module
@@ -534,7 +534,7 @@ Each stage has an exit test written *before* the implementation. See [`docs/BUIL
 | **PyTorch 2.13** | Autograd, tensor math, and device management — every layer above that is hand-written |
 | **NumPy** | `memmap` corpus reader and the `uint16` on-disk token format |
 | **Apple MPS** | Primary development accelerator; bf16 autocast, fused `scaled_dot_product_attention` |
-| **pytest** | 359-test TDD suite — exit tests written before each module |
+| **pytest** | 371-test TDD suite — exit tests written before each module |
 | **ruff** | Linting and formatting, 100-char lines, `E/F/I/W/UP/B` rule set |
 | **mypy** | Static type checking across all eight packages |
 | **PyYAML** | Config format, reused as the CLI override parser so types can never diverge |
