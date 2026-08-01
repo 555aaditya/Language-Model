@@ -33,10 +33,10 @@ tokenizer ──► dataset ──► training ──► checkpoints ──► i
 | 3 | **model** ✅ | attention | `CausalLM` (embed → blocks → RMSNorm → LM head) | 25 unit tests |
 | 4 | **training** ✅ | dataset + model | AdamW + cosine + AMP loop | 58 unit tests (incl. overfit-one-batch) |
 | 5 | **inference** ✅ | model ckpt | greedy / top-k / top-p sampling | 29 unit tests |
-| 6 | **optimization** | model ckpt | int8/int4 quant + optional kernels | perplexity-within-tolerance test |
-| 7 | **benchmark** | all | latency / throughput / memory / perplexity harness | reproduces a recorded baseline |
+| 6 | **optimization** ✅ | model ckpt | int8/int4 per-channel quant + preallocated KV arena | 38 unit tests (incl. perplexity-within-tolerance) |
+| 7 | **benchmark** ✅ | all | latency / throughput / memory harness | 18 unit tests (incl. baseline reproduction) |
 
-> Stages 0–5 are implemented (204 tests). Keep 6 optional/feature-flagged so it never blocks 5.
+> All 8 stages are implemented (264 tests).
 
 ## Contracts (stable interfaces — change only via ADR)
 
@@ -74,7 +74,17 @@ def generate(model, tokenizer, prompt: str, *, max_new_tokens: int, **sampling) 
 
 
 # optimization
-def quantize(model, *, bits: int = 8, scheme: str = "int8_weight") -> nn.Module: ...
+def quantize(model, *, bits=8, scheme="int_weight", skip=("lm_head",)) -> nn.Module: ...
+def preallocated_cache(model, *, batch_size=1, max_seq_len=None) -> list[PreallocatedKVCache]: ...
+
+
+# `skip` defaults to the LM head because it is normally tied to the token
+# embedding; quantising it would sever the tie and save nothing.
+
+
+# benchmark -- metrics split by how much they can be trusted
+def deterministic_report(cfg) -> dict: ...  # exact; asserted against a baseline
+def measured_report(cfg) -> dict: ...  # wall-clock; reproducible in shape only
 ```
 
 ## Conventions
