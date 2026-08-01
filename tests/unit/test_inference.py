@@ -165,9 +165,7 @@ def test_sampling_is_reproducible_with_a_seeded_generator():
         ),
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
         ),
     ],
 )
@@ -189,9 +187,7 @@ def test_a_seed_gives_the_same_token_on_every_device():
     """Drawing on the generator's device makes seeded output device-independent."""
     logits = torch.randn(VOCAB)
     on_cpu = sample(logits, temperature=0.9, generator=torch.Generator().manual_seed(11))
-    on_mps = sample(
-        logits.to("mps"), temperature=0.9, generator=torch.Generator().manual_seed(11)
-    )
+    on_mps = sample(logits.to("mps"), temperature=0.9, generator=torch.Generator().manual_seed(11))
     assert on_cpu == on_mps
 
 

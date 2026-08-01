@@ -60,6 +60,7 @@ class CausalLM(nn.Module):
     @classmethod
     def from_config(cls, cfg: dict) -> "CausalLM": ...
 
+
 # forward returns logits only -- cross-entropy lives in the trainer, so the
 # model stays pure for inference. Because of that there is nowhere to return a
 # freshly built cache, so the cache is CALLER-OWNED: allocate once with
