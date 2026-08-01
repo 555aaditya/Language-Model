@@ -1,0 +1,125 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---------------------------------------------------------------------------
+# Testing / Linting / Type-checking caches
+# ---------------------------------------------------------------------------
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+nosetests.xml
+coverage.xml
+
+# ---------------------------------------------------------------------------
+# Virtual environments / package managers
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+.python-version
+poetry.lock.persona
+uv.lock.persona
+
+# ---------------------------------------------------------------------------
+# Model checkpoints / training artifacts (large binaries, never commit)
+# ---------------------------------------------------------------------------
+checkpoints/*
+!checkpoints/.gitkeep
+runs/
+logs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# ---------------------------------------------------------------------------
+# Data files / datasets (large, regenerable, or licensed)
+# ---------------------------------------------------------------------------
+dataset/data/
+data/
+*.npy
+*.npz
+*.memmap
+*.h5
+*.hdf5
+*.parquet
+*.arrow
+
+# ---------------------------------------------------------------------------
+# Raw / source text dumps
+# ---------------------------------------------------------------------------
+arxiv.txt
+
+# ---------------------------------------------------------------------------
+# Secrets & environment files (NEVER commit API keys / tokens)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.env
+.env.local
+.env.production
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+config/api_keys*.yaml
+
+# ---------------------------------------------------------------------------
+# OS / editor / editor-config files
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes/
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Notebooks / scratch experiments (work-in-progress, not part of the package)
+# ---------------------------------------------------------------------------
+test_agent.py

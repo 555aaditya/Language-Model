@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "language-model"
+version = "0.1.0"
+description = "Production-grade decoder-only language model built from scratch in PyTorch"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "psutil>=5.9",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+# E741: ambiguous variable names are common in ML (l, m, i); allow them.
+ignore = ["E741"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+# Start lenient; tighten per-module as the codebase grows.
+disable_error_code = ["import-untyped"]
+
+[tool.setuptools]
+packages = [
+    "tokenizer",
+    "dataset",
+    "model",
+    "attention",
+    "training",
+    "inference",
+    "optimization",
+    "benchmark",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
