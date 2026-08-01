@@ -1,0 +1,45 @@
+# Default training / model configuration.
+# Overridable per-key via the CLI:  python -m training.train --config configs/default.yaml training.lr=1e-4
+
+seed: 42
+
+model:
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  n_kv_heads: 2          # grouped-query attention (n_kv_heads < n_heads)
+  d_ff: 2048
+  vocab_size: 4096
+  max_seq_len: 1024
+  rope_theta: 10000.0
+  dropout: 0.0
+
+attention:
+  impl: sdpa             # sdpa | flash | manual
+  kv_cache: true
+
+dataset:
+  source: synthetic      # synthetic | file | hf
+  seq_len: 512
+  batch_size: 16
+  num_workers: 0
+
+training:
+  steps: 2000
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 200
+  weight_decay: 0.1
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: bfloat16
+  grad_accum_steps: 1
+  log_every: 50
+  ckpt_every: 500
+  out_dir: checkpoints
+
+inference:
+  max_new_tokens: 128
+  temperature: 1.0
+  top_k: 0
+  top_p: 1.0
