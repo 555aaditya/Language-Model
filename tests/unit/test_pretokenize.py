@@ -163,7 +163,10 @@ def test_encode_scales_far_better_than_quadratically():
 
     small = encode_time(8_192)
     large = encode_time(131_072)  # 16x the input
-    assert large < small * 32, f"16x input cost {large / small:.0f}x time -- looks quadratic"
+    # Quadratic would be ~256x. The bound is loose on purpose: this runs on
+    # shared CI runners where a 2x timing margin flakes, and the test only needs
+    # to separate linear-ish from quadratic.
+    assert large < small * 64, f"16x input cost {large / small:.0f}x time -- looks quadratic"
 
 
 def test_the_cache_does_not_change_the_answer():
