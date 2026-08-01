@@ -1,6 +1,6 @@
 """Byte-level Byte Pair Encoding (BPE) tokenizer built from scratch.
 
-Design notes (see vault/research/transformer_notes.md & decisions/):
+Design notes (see docs/TDD.md §1 and TDR-002):
 
 - Byte-level: Text is encoded to UTF-8 bytes, so any text (including emojis and
   rare unicode) is tokenizable with no "unknown" tokens. This mirrors GPT-2's
@@ -11,7 +11,7 @@ Design notes (see vault/research/transformer_notes.md & decisions/):
 - Memory: encoder is a dict (token_key -> id), decoder is a dict (id -> token_key).
   Merges are stored as rank-ordered lists so we can encode greedily.
 
-API contract (see vault/implementation/module_interfaces.md):
+API contract (see docs/BUILD_ORDER.md "Contracts"):
     BPE(vocab_size, special_tokens)
     .train(texts)
     .encode(text) -> list[int]
